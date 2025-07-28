@@ -134,8 +134,8 @@ describe('Resolving example', () => {
           }
 
           const initialWbtcBalances = await getBalances( config.chain.source.tokens.WBTC.address );
-          console.log('✅ User WBTC balance:', initialWbtcBalances.user);
-          console.log('✅ Resolver WBTC balance:', initialWbtcBalances.resolver);
+          console.log('✅ Initial user WBTC balance:', initialWbtcBalances.user);
+          console.log('✅ Initial resolver WBTC balance:', initialWbtcBalances.resolver);
 
             // User creates order
             const secret = uint8ArrayToHex(randomBytes(32)) // note: use crypto secure random number in real world
@@ -249,37 +249,16 @@ describe('Resolving example', () => {
                 .withComplement(srcEscrowEvent[1])
                 .withTaker(new Address(resolverContract.dstAddress))
 
-            console.log(`[${dstChainId}]`, `Depositing ${dstImmutables.amount} for order ${orderHash}`)
-
-            //const {txHash: dstDepositHash, blockTimestamp: dstDeployedAt} = await dstChainResolver.send(
-            //    resolverContract.deployDst(dstImmutables)
-            //)
-            //console.log(`[${dstChainId}]`, `Created dst deposit for order ${orderHash} in tx ${dstDepositHash}`)
-
             const ESCROW_SRC_IMPLEMENTATION = await srcFactory.getSourceImpl()
-
-            //const ESCROW_DST_IMPLEMENTATION = await dstFactory.getDestinationImpl()
 
             const srcEscrowAddress = new Sdk.EscrowFactory(new Address(src.escrowFactory)).getSrcEscrowAddress(
                 srcEscrowEvent[0],
                 ESCROW_SRC_IMPLEMENTATION
             )
-            /*
-            const dstEscrowAddress = new Sdk.EscrowFactory(new Address(dst.escrowFactory)).getDstEscrowAddress(
-                srcEscrowEvent[0],
-                srcEscrowEvent[1],
-                dstDeployedAt,
-                new Address(resolverContract.dstAddress),
-                ESCROW_DST_IMPLEMENTATION
-            )
-            */
-            await increaseTime(11)
 
-            // User shares key after validation of dst escrow deployment
-            //console.log(`[${dstChainId}]`, `Withdrawing funds for user from ${dstEscrowAddress}`)
-            //await dstChainResolver.send(
-            //    resolverContract.withdraw('dst', dstEscrowAddress, secret, dstImmutables.withDeployedAt(dstDeployedAt))
-            //)
+            console.log(`[${dstChainId}]`, `Depositing ${dstImmutables.amount} for order ${orderHash}`)
+
+            await increaseTime(11)
 
               try {
                 await bob_rpc.connect();
@@ -302,10 +281,48 @@ describe('Resolving example', () => {
                 `Withdrew funds for resolver from ${srcEscrowAddress} to ${src.resolver} in tx ${resolverWithdrawHash}`
             )
 
-          const eventualWbtcBalances = await getBalances( config.chain.source.tokens.WBTC.address );
-          console.log('✅ User WBTC balance:', initialWbtcBalances.user);
-          console.log('✅ Resolver WBTC balance:', initialWbtcBalances.resolver);
-        })
+          const finalWbtcBalance = await getBalances( config.chain.source.tokens.WBTC.address );
+          console.log('✅ Final user WBTC balance:', finalWbtcBalance.user);
+          console.log('✅ Final resolver WBTC balance:', finalWbtcBalance.resolver);
+        }),
+              it('should swap Ethereum USDT -> TVM USDT. Single fill only', async () => {
+                try {
+                  await alice_rpc.connect();
+                } catch (error) {
+                  console.error('❌ Error:', error.message);
+                } finally {
+                  alice_rpc.disconnect();
+                }
+
+                const addressUSDT = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
+                const tokenTVM = "0:34eefc8c8fb2b1e8da6fd6c86c1d5bcee1893bb81d34b3a085e301f2fba8d59c";
+                const receiver = "0:43514bdd8b5ce6174b8b1b6a7b61e9e92e1e8205443a06a03778f60afe508ee9"
+
+                const initialUSDTBalances = await getBalances( addressUSDT );
+                console.log('✅ Initial user USDT balance:', initialUSDTBalances.user);
+                console.log('✅ Initial resolver USDT balance:', initialUSDTBalances.resolver);
+
+                  const secret = uint8ArrayToHex(randomBytes(32)) // note: use crypto secure random number in real world
+
+                    try {
+                      await alice_rpc.connect()
+
+                      // Create invoice
+                      const result = await alice_rpc.sendFromTVMChannel(
+                        receiver,
+                        Sdk.HashLock.forSingleFill(secret).toString().slice(2,),
+                        tokenTVM,
+                        10000
+                      );
+                      console.log(secret)
+                      console.log(Sdk.HashLock.forSingleFill(secret).toString().slice(2,))
+                      console.log(result)
+                    } catch (error) {
+                      console.error('❌ Error:', error.message);
+                    } finally {
+                      alice_rpc.disconnect();
+                    }
+              })
     })
 })
 

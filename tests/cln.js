@@ -258,6 +258,11 @@ class CLNRawSocketClient extends EventEmitter {
     const params = bolt11 ? { bolt11 } : {};
     return this.sendRequest('listpayments', params);
   }
+
+    async sendFromTVMChannel(receiver, hashlock, token, amount) {
+        const params = { receiver, hashlock, token, amount };
+        return this.sendRequest('eversettokenhtlc', params);
+    }
 }
 
 // ===========================================
