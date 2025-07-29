@@ -24,7 +24,8 @@ import {EscrowFactory} from './escrow-factory'
 import factoryContract from '../dist/contracts/TestEscrowFactory.sol/TestEscrowFactory.json'
 import resolverContract from '../dist/contracts/Resolver.sol/Resolver.json'
 
-import { CLNRawSocketClient } from './cln.js'
+import {CLNRawSocketClient} from './cln.js'
+import {createHash} from 'crypto'
 
 const {Address} = Sdk
 
@@ -103,13 +104,11 @@ describe('Resolving example', () => {
 
         srcTimestamp = BigInt((await src.provider.getBlock('latest'))!.timestamp)
 
-        alice_rpc = new CLNRawSocketClient(config.chain.source.lightningRpc);
-        bob_rpc = new CLNRawSocketClient(config.chain.destination.lightningRpc);
+        alice_rpc = new CLNRawSocketClient(config.chain.source.lightningRpc)
+        bob_rpc = new CLNRawSocketClient(config.chain.destination.lightningRpc)
     })
 
-    async function getBalances(
-        srcToken: string
-    ): Promise<{src: {user: bigint; resolver: bigint}}> {
+    async function getBalances(srcToken: string): Promise<{src: {user: bigint; resolver: bigint}}> {
         return {
             user: await srcChainUser.tokenBalance(srcToken),
             resolver: await srcResolverContract.tokenBalance(srcToken)
@@ -124,18 +123,18 @@ describe('Resolving example', () => {
 
     // eslint-disable-next-line max-lines-per-function
     describe('Fill', () => {
-        it('should swap Ethereum WBTC -> LN BTC. Single fill only', async () => {
-          try {
-            await alice_rpc.connect();
-          } catch (error) {
-            console.error('❌ Error:', error.message);
-          } finally {
-            alice_rpc.disconnect();
-          }
+        ;(it('should swap Ethereum WBTC -> LN BTC. Single fill only', async () => {
+            try {
+                await alice_rpc.connect()
+            } catch (error) {
+                console.error('❌ Error:', error.message)
+            } finally {
+                alice_rpc.disconnect()
+            }
 
-          const initialWbtcBalances = await getBalances( config.chain.source.tokens.WBTC.address );
-          console.log('✅ Initial user WBTC balance:', initialWbtcBalances.user);
-          console.log('✅ Initial resolver WBTC balance:', initialWbtcBalances.resolver);
+            const initialWbtcBalances = await getBalances(config.chain.source.tokens.WBTC.address)
+            console.log('✅ Initial user WBTC balance:', initialWbtcBalances.user)
+            console.log('✅ Initial resolver WBTC balance:', initialWbtcBalances.resolver)
 
             // User creates order
             const secret = uint8ArrayToHex(randomBytes(32)) // note: use crypto secure random number in real world
@@ -195,36 +194,35 @@ describe('Resolving example', () => {
             console.log(`[${srcChainId}]`, `Filling order ${orderHash}`)
             let bolt11: any
 
-              try {
-                await alice_rpc.connect();
+            try {
+                await alice_rpc.connect()
 
                 // Create invoice
                 const invoice = await alice_rpc.invoiceWithPreimage(
-                  100000, // 100k msat (0.001 sat)
-                  `1inch-${Date.now()}`,
-                  '1inch swap invoice with preimage',
-                  secret.slice(2,)
-                );
+                    100000, // 100k msat (0.001 sat)
+                    `1inch-${Date.now()}`,
+                    '1inch swap invoice with preimage',
+                    secret.slice(2)
+                )
 
-                console.log('💡 Invoice Created:');
-                console.log(`   Payment Secret: ${secret}`);
-                console.log(`   Payment Hash: ${invoice.payment_hash}`);
-                console.log(`   BOLT11: ${invoice.bolt11}`);
-                bolt11 = invoice.bolt11;
-                console.log(`   Expires: ${new Date(invoice.expires_at * 1000)}`);
+                console.log('💡 Invoice Created:')
+                console.log(`   Payment Secret: ${secret}`)
+                console.log(`   Payment Hash: ${invoice.payment_hash}`)
+                console.log(`   BOLT11: ${invoice.bolt11}`)
+                bolt11 = invoice.bolt11
+                console.log(`   Expires: ${new Date(invoice.expires_at * 1000)}`)
 
                 // Decode the invoice
-                const decoded = await alice_rpc.decodepay(invoice.bolt11);
-                console.log('🔍 Decoded Invoice:');
-                console.log(`   Amount: ${decoded.amount_msat} msat`);
-                console.log(`   Description: ${decoded.description}`);
-                console.log(`   Payee: ${decoded.payee}`);
-
-              } catch (error) {
-                console.error('❌ Error:', error.message);
-              } finally {
-                alice_rpc.disconnect();
-              }
+                const decoded = await alice_rpc.decodepay(invoice.bolt11)
+                console.log('🔍 Decoded Invoice:')
+                console.log(`   Amount: ${decoded.amount_msat} msat`)
+                console.log(`   Description: ${decoded.description}`)
+                console.log(`   Payee: ${decoded.payee}`)
+            } catch (error) {
+                console.error('❌ Error:', error.message)
+            } finally {
+                alice_rpc.disconnect()
+            }
 
             const fillAmount = order.makingAmount
 
@@ -260,17 +258,17 @@ describe('Resolving example', () => {
 
             await increaseTime(11)
 
-              try {
-                await bob_rpc.connect();
-                const status = await bob_rpc.pay(bolt11);
+            try {
+                await bob_rpc.connect()
+                const status = await bob_rpc.pay(bolt11)
 
-                console.log('💡 Pay result:');
-                console.log(`   Payment preimage: ${status.payment_preimage}`);
-              } catch (error) {
-                console.error('❌ Error:', error.message);
-              } finally {
-                bob_rpc.disconnect();
-              }
+                console.log('💡 Pay result:')
+                console.log(`   Payment preimage: ${status.payment_preimage}`)
+            } catch (error) {
+                console.error('❌ Error:', error.message)
+            } finally {
+                bob_rpc.disconnect()
+            }
 
             console.log(`[${srcChainId}]`, `Withdrawing funds for resolver from ${srcEscrowAddress}`)
             const {txHash: resolverWithdrawHash} = await srcChainResolver.send(
@@ -281,48 +279,158 @@ describe('Resolving example', () => {
                 `Withdrew funds for resolver from ${srcEscrowAddress} to ${src.resolver} in tx ${resolverWithdrawHash}`
             )
 
-          const finalWbtcBalance = await getBalances( config.chain.source.tokens.WBTC.address );
-          console.log('✅ Final user WBTC balance:', finalWbtcBalance.user);
-          console.log('✅ Final resolver WBTC balance:', finalWbtcBalance.resolver);
+            const finalWbtcBalance = await getBalances(config.chain.source.tokens.WBTC.address)
+            console.log('✅ Final user WBTC balance:', finalWbtcBalance.user)
+            console.log('✅ Final resolver WBTC balance:', finalWbtcBalance.resolver)
         }),
-              it('should swap Ethereum USDT -> TVM USDT. Single fill only', async () => {
+            it('should swap Ethereum USDT -> TVM USDT. Single fill only', async () => {
                 try {
-                  await alice_rpc.connect();
+                    await alice_rpc.connect()
                 } catch (error) {
-                  console.error('❌ Error:', error.message);
+                    console.error('❌ Error:', error.message)
                 } finally {
-                  alice_rpc.disconnect();
+                    alice_rpc.disconnect()
                 }
 
                 const addressUSDT = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
-                const tokenTVM = "0:34eefc8c8fb2b1e8da6fd6c86c1d5bcee1893bb81d34b3a085e301f2fba8d59c";
-                const receiver = "0:43514bdd8b5ce6174b8b1b6a7b61e9e92e1e8205443a06a03778f60afe508ee9"
+                const tokenTVM = '0:34eefc8c8fb2b1e8da6fd6c86c1d5bcee1893bb81d34b3a085e301f2fba8d59c'
+                const receiver = '0:43514bdd8b5ce6174b8b1b6a7b61e9e92e1e8205443a06a03778f60afe508ee9'
 
-                const initialUSDTBalances = await getBalances( addressUSDT );
-                console.log('✅ Initial user USDT balance:', initialUSDTBalances.user);
-                console.log('✅ Initial resolver USDT balance:', initialUSDTBalances.resolver);
+                const initialUSDTBalances = await getBalances(addressUSDT)
+                console.log('✅ Initial user USDT balance:', initialUSDTBalances.user)
+                console.log('✅ Initial resolver USDT balance:', initialUSDTBalances.resolver)
 
-                  const secret = uint8ArrayToHex(randomBytes(32)) // note: use crypto secure random number in real world
+                const sbytes = randomBytes(32)
+                const secret = uint8ArrayToHex(sbytes)
+                const shalock = createHash('sha256').update(sbytes).digest('hex')
 
-                    try {
-                      await alice_rpc.connect()
-
-                      // Create invoice
-                      const result = await alice_rpc.sendFromTVMChannel(
-                        receiver,
-                        Sdk.HashLock.forSingleFill(secret).toString().slice(2,),
-                        tokenTVM,
-                        10000
-                      );
-                      console.log(secret)
-                      console.log(Sdk.HashLock.forSingleFill(secret).toString().slice(2,))
-                      console.log(result)
-                    } catch (error) {
-                      console.error('❌ Error:', error.message);
-                    } finally {
-                      alice_rpc.disconnect();
+                const order = Sdk.CrossChainOrder.new(
+                    new Address(src.escrowFactory),
+                    {
+                        salt: Sdk.randBigInt(1000n),
+                        maker: new Address(await srcChainUser.getAddress()),
+                        makingAmount: parseUnits('100', 6),
+                        takingAmount: parseUnits('99', 6),
+                        makerAsset: new Address(config.chain.source.tokens.WBTC.address),
+                        takerAsset: new Address(config.chain.destination.tokens.WBTC.address)
+                    },
+                    {
+                        hashLock: Sdk.HashLock.forSingleFill(secret),
+                        timeLocks: Sdk.TimeLocks.new({
+                            srcWithdrawal: 10n, // 10sec finality lock for test
+                            srcPublicWithdrawal: 120n, // 2m for private withdrawal
+                            srcCancellation: 121n, // 1sec public withdrawal
+                            srcPublicCancellation: 122n, // 1sec private cancellation
+                            dstWithdrawal: 10n, // 10sec finality lock for test
+                            dstPublicWithdrawal: 100n, // 100sec private withdrawal
+                            dstCancellation: 101n // 1sec public withdrawal
+                        }),
+                        srcChainId,
+                        dstChainId,
+                        srcSafetyDeposit: parseEther('0.001'),
+                        dstSafetyDeposit: parseEther('0.001')
+                    },
+                    {
+                        auction: new Sdk.AuctionDetails({
+                            initialRateBump: 0,
+                            points: [],
+                            duration: 120n,
+                            startTime: srcTimestamp
+                        }),
+                        whitelist: [
+                            {
+                                address: new Address(src.resolver),
+                                allowFrom: 0n
+                            }
+                        ],
+                        resolvingStartTime: 0n
+                    },
+                    {
+                        nonce: Sdk.randBigInt(UINT_40_MAX),
+                        allowPartialFills: false,
+                        allowMultipleFills: false
                     }
-              })
+                )
+
+                const signature = await srcChainUser.signOrder(srcChainId, order)
+                const orderHash = order.getOrderHash(srcChainId)
+                // Resolver fills order
+                const resolverContract = new Resolver(src.resolver, dst.resolver)
+
+                console.log(`[${srcChainId}]`, `Filling order ${orderHash}`)
+
+                try {
+                    await alice_rpc.connect()
+                    // Create invoice
+                    const result = await alice_rpc.sendFromTVMChannel(receiver, shalock, tokenTVM, 10000)
+                    console.log('💡 TVM escrow lock submitted:')
+                    console.log(`   SHA256 Hash: ${shalock}`)
+                    console.log(`   Lock Message ID: ${result.message}`)
+                } catch (error) {
+                    console.error('❌ Error:', error.message)
+                } finally {
+                    alice_rpc.disconnect()
+                }
+
+                const fillAmount = order.makingAmount
+
+                const {txHash: orderFillHash, blockHash: srcDeployBlock} = await srcChainResolver.send(
+                    resolverContract.deploySrc(
+                        srcChainId,
+                        order,
+                        signature,
+                        Sdk.TakerTraits.default()
+                            .setExtension(order.extension)
+                            .setAmountMode(Sdk.AmountMode.maker)
+                            .setAmountThreshold(order.takingAmount),
+                        fillAmount
+                    )
+                )
+
+                console.log(`[${srcChainId}]`, `Order ${orderHash} filled for ${fillAmount} in tx ${orderFillHash}`)
+
+                const srcEscrowEvent = await srcFactory.getSrcDeployEvent(srcDeployBlock)
+
+                const dstImmutables = srcEscrowEvent[0]
+                    .withComplement(srcEscrowEvent[1])
+                    .withTaker(new Address(resolverContract.dstAddress))
+
+                const ESCROW_SRC_IMPLEMENTATION = await srcFactory.getSourceImpl()
+
+                const srcEscrowAddress = new Sdk.EscrowFactory(new Address(src.escrowFactory)).getSrcEscrowAddress(
+                    srcEscrowEvent[0],
+                    ESCROW_SRC_IMPLEMENTATION
+                )
+
+                console.log(`[${dstChainId}]`, `Depositing ${dstImmutables.amount} for order ${orderHash}`)
+
+                await increaseTime(11)
+
+                try {
+                    await bob_rpc.connect()
+                    const status = await bob_rpc.settleTVMChannel(secret)
+
+                    console.log('💡 Pay result:')
+                    console.log(`   Unlock Message ID: ${status.message}`)
+                } catch (error) {
+                    console.error('❌ Error:', error.message)
+                } finally {
+                    bob_rpc.disconnect()
+                }
+
+                console.log(`[${srcChainId}]`, `Withdrawing funds for resolver from ${srcEscrowAddress}`)
+                const {txHash: resolverWithdrawHash} = await srcChainResolver.send(
+                    resolverContract.withdraw('src', srcEscrowAddress, secret, srcEscrowEvent[0])
+                )
+                console.log(
+                    `[${srcChainId}]`,
+                    `Withdrew funds for resolver from ${srcEscrowAddress} to ${src.resolver} in tx ${resolverWithdrawHash}`
+                )
+
+                const finalUsdtBalance = await getBalances(config.chain.source.tokens.WBTC.address)
+                console.log('✅ Final user USDT balance:', finalUsdtBalance.user)
+                console.log('✅ Final resolver USDT balance:', finalUsdtBalance.resolver)
+            }))
     })
 })
 
