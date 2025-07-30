@@ -354,7 +354,6 @@ describe('Resolving example', () => {
 
                 const signature = await srcChainUser.signOrder(srcChainId, order)
                 const orderHash = order.getOrderHash(srcChainId)
-                // Resolver fills order
                 const resolverContract = new Resolver(src.resolver, dst.resolver)
 
                 console.log(`[${srcChainId}]`, `Filling order ${orderHash}`)
@@ -408,7 +407,7 @@ describe('Resolving example', () => {
 
                 try {
                     await bob_rpc.connect()
-                    const status = await bob_rpc.settleTVMChannel(secret)
+                    const status = await bob_rpc.settleTVMChannel(secret.slice(2))
 
                     console.log('💡 Pay result:')
                     console.log(`   Unlock Message ID: ${status.message}`)
