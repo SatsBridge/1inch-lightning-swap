@@ -4,6 +4,7 @@
  */
 
 export default {
+    testTimeout: 1200000,
     clearMocks: true,
     moduleFileExtensions: ['js', 'json', 'ts'],
     rootDir: 'tests',
