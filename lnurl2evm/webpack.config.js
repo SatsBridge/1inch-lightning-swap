@@ -8,7 +8,10 @@ const __dirname = path.dirname(__filename);
 
 export default {
   context: path.resolve(__dirname, "src"),
-  entry: "./main.ts",
+  entry: {
+    server: "./server.ts",
+    client: "./client.ts",
+  },
   experiments: {
     outputModule: true,
   },

@@ -20,8 +20,6 @@ import {
   WalletClient,
   Transport,
   Account,
-  decodeAbiParameters,
-  encodeAbiParameters,
   encodePacked,
   fromHex,
   AccountSource,
@@ -29,6 +27,9 @@ import {
   CustomSource,
   InvalidAddressError,
   isAddress,
+  numberToHex,
+  serializeSignature,
+  recoverPublicKey,
 } from "viem";
 import {
   entryPoint06Abi,
@@ -349,16 +350,16 @@ type State<
   account extends SmartAccount | undefined = SmartAccount | undefined,
   accountOverride extends SmartAccount | undefined = undefined,
 > = {
-  [k1_session: string]: {
+  [sessionK1: string]: {
     sse: SSE;
-    key?: string;
-    txs: {
-      [k1: string]: {
+    counterpartyKey?: string;
+    userOps: {
+      [userOpK1: string]: {
         safeAccountParams: ToSafeSmartAccountParameters<
           entryPointVersion,
           TErc7579
         >;
-        userop: PrepareUserOperationReturnType<
+        userOp: PrepareUserOperationReturnType<
           account,
           accountOverride,
           calls,
@@ -369,7 +370,7 @@ type State<
   };
 };
 
-function toLnurl(url: String) {
+function toLnurl(url: string) {
   return bech32
     .encode("LNURL", bech32.toWords(Buffer.from(url, "utf8")), 1023)
     .toUpperCase();
@@ -377,8 +378,7 @@ function toLnurl(url: String) {
 
 let state: State<"0.7", undefined, unknown[], any, undefined> = {};
 const serviceOwner = privateKeyToAccount(`0x${process.env.SERVICE_KEY!}`);
-//const ownersThreshold = 2n;
-const ownersThreshold = 1n;
+const ownersThreshold = 2n;
 const entryPointVersion = "0.7";
 const chainId = 11155111;
 const safeVersion = "1.4.1";
@@ -403,40 +403,39 @@ const app = express();
 
 app.use(cors());
 
-app.get("/vault/tx", (req, res) => {
-  const random = new Uint8Array(32);
+app.get("/vault/userOp", (req, res) => {
+  const sessionK1Material = new Uint8Array(32);
 
-  webcrypto.getRandomValues(random);
+  webcrypto.getRandomValues(sessionK1Material);
 
-  const k1_session = toHex(random).slice(2);
+  const sessionK1 = toHex(sessionK1Material).slice(2);
   const url = new URL(
-    `${req.protocol}://${process.env.HOST ?? req.host}/vault/tx/login_and_prepare?tag=login&k1=${k1_session}&action=register`,
+    `${req.protocol}://${process.env.HOST ?? req.host}/vault/userOp/loginAndPrepare?tag=login&k1=${sessionK1}&action=register`,
   );
   const lnurl = toLnurl(url.toString());
   const sse = new SSE();
 
-  state[k1_session] = { sse, txs: {} };
+  state[sessionK1] = { sse, userOps: {} };
 
   req.on("close", () => {
-    delete state[k1_session];
+    delete state[sessionK1];
   });
   sse.init(req, res);
-  sse.send({ k1_session, lnurl });
+  sse.send({ sessionK1: sessionK1, lnurl });
 });
 
-async function prepare_tx(
-  k1_session: string,
-  key: string,
-  address: Address,
+async function prepareUserOp(
+  sessionK1: string,
+  counterpartyKey: string,
+  counterpartyAddress: Address,
   req: Request,
-  res: Response,
 ): Promise<{
-  k1_tx: string;
+  userOpK1: string;
   lnurl: string;
 }> {
-  const counterparty = toAccount(
+  const counterpartyOwner = toAccount(
     {
-      address,
+      address: counterpartyAddress,
 
       async signMessage(_message) {
         throw Error("Not supported");
@@ -453,8 +452,7 @@ async function prepare_tx(
 
     "public",
   );
-  //const owners = [serviceOwner, counterparty];
-  const owners = [counterparty];
+  const owners = [serviceOwner, counterpartyOwner];
   const safeAccountParams = {
     client: publicClient,
     entryPoint: {
@@ -479,7 +477,7 @@ async function prepare_tx(
         (await paymasterClient.getUserOperationGasPrice()).fast,
     },
   });
-  const userop = await smartAccountClient.prepareUserOperation({
+  const userOp = await smartAccountClient.prepareUserOperation({
     calls: [
       {
         to: zeroAddress,
@@ -488,55 +486,60 @@ async function prepare_tx(
       },
     ],
   });
-  const hash = await hashUserOperation(safeAccountParams, userop);
-  const k1_tx = hash.slice(2);
+  const userOpHash = await hashUserOperation(safeAccountParams, userOp);
+  const userOpK1 = userOpHash.slice(2);
 
-  Object.assign(state[k1_session], {
-    key,
+  Object.assign(state[sessionK1], {
+    counterpartyKey,
   });
-  state[k1_session].txs[k1_tx] = {
+  state[sessionK1].userOps[userOpK1] = {
     safeAccountParams,
-    userop,
+    userOp,
   };
 
   const url = new URL(
-    `${req.protocol}://${process.env.HOST ?? req.host}/vault/tx/commit/${k1_session}?tag=login&k1=${k1_tx}&action=auth`,
+    `${req.protocol}://${process.env.HOST ?? req.host}/vault/userOp/commit/${sessionK1}?tag=login&k1=${userOpK1}&action=auth`,
   );
   const lnurl = toLnurl(url.toString());
 
-  return { k1_tx, lnurl };
+  return { userOpK1, lnurl };
 }
 
 app.get(
-  "/vault/tx/login_and_prepare",
+  "/vault/userOp/loginAndPrepare",
   async (
     req: TypedRequest<{ k1?: string; key?: string; sig?: string }>,
     res,
   ) => {
-    const { k1: k1_session, key, sig } = req.query;
+    const { k1: sessionK1, key: counterpartyKey, sig: signature } = req.query;
 
-    if (k1_session === undefined) {
+    if (sessionK1 === undefined) {
       res.status(400).send({ status: "ERROR", reason: "Missing k1" });
 
       return;
     }
 
-    if (key === undefined) {
+    if (counterpartyKey === undefined) {
       res.status(400).send({ status: "ERROR", reason: "Missing key" });
 
       return;
     }
 
-    if (sig === undefined) {
+    if (signature === undefined) {
       res.status(400).send({ status: "ERROR", reason: "Missing sig" });
 
       return;
     }
 
-    let address: Address;
+    let counterpartyAddress: Address;
 
     try {
-      address = publicKeyToAddress(`0x${key}`);
+      const uncompressedCounterpartyKey =
+        secp256k1.Point.fromHex(counterpartyKey).toHex(false);
+
+      counterpartyAddress = publicKeyToAddress(
+        `0x${uncompressedCounterpartyKey}`,
+      );
     } catch (_) {
       res.status(422).send({ status: "ERROR", reason: "Invalid key" });
 
@@ -545,28 +548,27 @@ app.get(
 
     if (
       secp256k1.verify(
-        fromHex(`0x${sig}`, "bytes"),
-        fromHex(`0x${k1_session}`, "bytes"),
-        fromHex(`0x${key}`, "bytes"),
+        fromHex(`0x${signature}`, "bytes"),
+        fromHex(`0x${sessionK1}`, "bytes"),
+        fromHex(`0x${counterpartyKey}`, "bytes"),
         {
           prehash: false,
           format: "der",
         },
       )
     ) {
-      const { k1_tx, lnurl } = await prepare_tx(
-        k1_session,
-        key,
-        address,
+      const { userOpK1, lnurl } = await prepareUserOp(
+        sessionK1,
+        counterpartyKey,
+        counterpartyAddress,
         req,
-        res,
       );
 
-      if (k1_session in state) {
-        state[k1_session].sse.send({
-          type: "login_and_prepare",
-          k1_tx,
-          key,
+      if (sessionK1 in state) {
+        state[sessionK1].sse.send({
+          type: "loginAndPrepare",
+          userOpK1,
+          counterpartyKey,
           lnurl,
         });
       } else {
@@ -579,79 +581,90 @@ app.get(
 
       res.send({ status: "OK" });
     } else {
-      res.status(422).send({ status: "ERROR", reason: "Invalid sig 2" });
+      res.status(422).send({ status: "ERROR", reason: "Invalid sig" });
     }
   },
 );
 
-app.get("/vault/tx/prepare/:k1_session", async (req, res) => {
-  const { k1_session } = req.params;
+app.get("/vault/userOp/prepare/:sessionK1", async (req, res) => {
+  const { sessionK1 } = req.params;
 
-  if (!(k1_session in state)) {
+  if (!(sessionK1 in state)) {
     res.status(422).send({ status: "ERROR", reason: "Session dont't exist" });
 
     return;
   }
 
-  const { key, txs } = state[k1_session];
+  const { counterpartyKey } = state[sessionK1];
 
-  if (key === undefined) {
+  if (counterpartyKey === undefined) {
     res.status(422).send({ status: "ERROR", reason: "Key don't revealed" });
 
     return;
   }
 
-  let address: Address;
+  let counterpartyAddress: Address;
 
   try {
-    address = publicKeyToAddress(`0x${key}`);
+    const uncompressedCounterpartyKey =
+      secp256k1.Point.fromHex(counterpartyKey).toHex(false);
+
+    counterpartyAddress = publicKeyToAddress(
+      `0x${uncompressedCounterpartyKey}`,
+    );
   } catch (_) {
     res.status(422).send({ status: "ERROR", reason: "Invalid key" });
 
     return;
   }
 
-  const { k1_tx, lnurl } = await prepare_tx(k1_session, key, address, req, res);
+  const { userOpK1, lnurl } = await prepareUserOp(
+    sessionK1,
+    counterpartyKey,
+    counterpartyAddress,
+    req,
+  );
 
-  res.send({ k1_tx, lnurl });
+  res.send({ userOpK1, lnurl });
 });
 
 app.get(
-  "/vault/tx/commit/:k1_session",
+  "/vault/userOp/commit/:sessionK1",
   async (
     req: TypedRequest<{ k1?: string; key?: string; sig?: string }>,
     res,
   ) => {
-    const { k1_session } = req.params;
-    const { k1: k1_tx, key, sig } = req.query;
+    const { sessionK1 } = req.params;
+    const { k1: userOpK1, key: counterpartyKey, sig: signature } = req.query;
 
-    if (k1_tx === undefined) {
+    if (userOpK1 === undefined) {
       res.status(400).send({ status: "ERROR", reason: "Missing k1" });
 
       return;
     }
 
-    if (key === undefined) {
+    if (counterpartyKey === undefined) {
       res.status(400).send({ status: "ERROR", reason: "Missing key" });
 
       return;
     }
 
-    if (sig === undefined) {
+    if (signature === undefined) {
       res.status(400).send({ status: "ERROR", reason: "Missing sig" });
 
       return;
     }
 
-    if (!(k1_session in state)) {
+    if (!(sessionK1 in state)) {
       res.status(422).send({ status: "ERROR", reason: "Session dont't exist" });
 
       return;
     }
 
-    const { key: session_key, txs } = state[k1_session];
+    const { counterpartyKey: counterpartyKeyInSession, userOps } =
+      state[sessionK1];
 
-    if (key !== session_key) {
+    if (counterpartyKey !== counterpartyKeyInSession) {
       res
         .status(422)
         .send({ status: "ERROR", reason: "Incorrect target session" });
@@ -659,10 +672,16 @@ app.get(
       return;
     }
 
-    let address: Address;
+    let uncompressedCounterpartyKey: string;
+    let counterpartyAddress: Address;
 
     try {
-      address = publicKeyToAddress(`0x${key}`);
+      uncompressedCounterpartyKey =
+        secp256k1.Point.fromHex(counterpartyKey).toHex(false);
+
+      counterpartyAddress = publicKeyToAddress(
+        `0x${uncompressedCounterpartyKey}`,
+      );
     } catch (_) {
       res.status(422).send({ status: "ERROR", reason: "Invalid key" });
 
@@ -671,22 +690,24 @@ app.get(
 
     if (
       secp256k1.verify(
-        fromHex(`0x${sig}`, "bytes"),
-        fromHex(`0x${k1_tx}`, "bytes"),
-        fromHex(`0x${key}`, "bytes"),
+        fromHex(`0x${signature}`, "bytes"),
+        fromHex(`0x${userOpK1}`, "bytes"),
+        fromHex(`0x${counterpartyKey}`, "bytes"),
         {
           prehash: false,
           format: "der",
         },
       )
     ) {
-      if (!(k1_tx in txs)) {
-        res.status(422).send({ status: "ERROR", reason: "Tx dont't exist" });
+      if (!(userOpK1 in userOps)) {
+        res
+          .status(422)
+          .send({ status: "ERROR", reason: "UserOp dont't exist" });
 
         return;
       }
 
-      const { safeAccountParams, userop } = txs[k1_tx];
+      const { safeAccountParams, userOp } = userOps[userOpK1];
       const { owners } = safeAccountParams;
       const localOwners = await Promise.all(
         owners
@@ -716,7 +737,7 @@ app.get(
             }),
           ),
       );
-      const safeAccount = await toSafeSmartAccount(safeAccountParams);\
+      const safeAccount = await toSafeSmartAccount(safeAccountParams);
       const smartAccountClient = createSmartAccountClient({
         account: safeAccount,
         bundlerTransport: http(
@@ -730,7 +751,7 @@ app.get(
         },
       });
 
-      if (localOwners.length < Number(ownersThreshold) - 1) {
+      if (localOwners.length < ownersThreshold - 1n) {
         res
           .status(500)
           .send({ status: "ERROR", reason: "Internal server error" });
@@ -740,97 +761,68 @@ app.get(
         );
       }
 
-      const signature = secp256k1.Signature.fromBytes(
-        fromHex(`0x${sig}`, "bytes"),
-        "der",
-      ).toHex("compact");
+      const { r, s } = secp256k1.Signature.fromHex(signature, "der");
+      let ethSignature: Hex | null = null;
 
-      let signatures: Hex = encodeAbiParameters(
-        [
-          {
-            components: [
-              { type: "address", name: "signer" },
-              { type: "bytes", name: "data" },
-            ],
-            name: "signatures",
-            type: "tuple[]",
-          },
-        ],
-        [
-          [
-            {
-              signer: address,
-              data: `0x${signature}`,
-            },
-          ],
-        ],
-      );
+      for (let yParity = 0; yParity <= 1; yParity++) {
+        ethSignature = serializeSignature({
+          r: numberToHex(r, { size: 32 }),
+          s: numberToHex(s, { size: 32 }),
+          yParity,
+          to: "hex",
+        });
 
-      for (const owner of localOwners) {
-        const { validAfter = 0, validUntil = 0 } = safeAccountParams;
-        const existingSignatures = signatures;
-        const localOwnersForSig = [
-          await toOwner({
-            owner: owner as OneOf<LocalAccount | EthereumProvider>,
-          }),
-        ];
+        const recoveredCounterpartyKey = (
+          await recoverPublicKey({
+            hash: `0x${userOpK1}`,
+            signature: ethSignature,
+          })
+        ).slice(2);
 
-        let unPackedSignatures: readonly { signer: Address; data: Hex }[] = [];
+        if (recoveredCounterpartyKey === uncompressedCounterpartyKey) {
+          break;
+        } else if (yParity === 1) {
+          res
+            .status(500)
+            .send({ status: "ERROR", reason: "Internal server error" });
 
-        if (existingSignatures) {
-          const decoded = decodeAbiParameters(
-            [
-              {
-                components: [
-                  { type: "address", name: "signer" },
-                  { type: "bytes", name: "data" },
-                ],
-                name: "signatures",
-                type: "tuple[]",
-              },
-            ],
-            existingSignatures,
-          );
-
-          unPackedSignatures = decoded[0];
-        }
-
-        const newSignatures: { signer: Address; data: Hex }[] = [
-          ...unPackedSignatures,
-          ...(await Promise.all(
-            localOwnersForSig.map(async (localOwner) => ({
-              signer: localOwner.address,
-              data: await localOwner.sign!({ hash: `0x${k1_tx}` }),
-            })),
-          )),
-        ];
-
-        if (newSignatures.length !== owners.length) {
-          signatures = encodeAbiParameters(
-            [
-              {
-                components: [
-                  { type: "address", name: "signer" },
-                  { type: "bytes", name: "data" },
-                ],
-                name: "signatures",
-                type: "tuple[]",
-              },
-            ],
-            [newSignatures],
-          );
-        } else {
-          newSignatures.sort((left, right) =>
-            left.signer.toLowerCase().localeCompare(right.signer.toLowerCase()),
-          );
-          const signatureBytes = concat(newSignatures.map((sig) => sig.data));
-
-          signatures = encodePacked(
-            ["uint48", "uint48", "bytes"],
-            [validAfter, validUntil, signatureBytes],
-          );
+          throw new Error("No valid signature");
         }
       }
+
+      const { validAfter = 0, validUntil = 0 } = safeAccountParams;
+      let unPackedSignatures = [
+        {
+          signer: counterpartyAddress,
+          data: ethSignature!,
+        },
+      ];
+
+      if (unPackedSignatures.length < ownersThreshold) {
+        for (const owner of localOwners) {
+          unPackedSignatures.push({
+            signer: owner.address,
+            data: await owner.sign!({ hash: `0x${userOpK1}` }),
+          });
+
+          if (BigInt(unPackedSignatures.length) === ownersThreshold) {
+            break;
+          }
+        }
+      }
+
+      unPackedSignatures.sort((left, right) =>
+        left.signer.toLowerCase().localeCompare(right.signer.toLowerCase()),
+      );
+
+      const signatures = encodePacked(
+        ["uint48", "uint48", "bytes"],
+        [
+          validAfter,
+          validUntil,
+          concat(unPackedSignatures.map((signature) => signature.data)),
+        ],
+      );
 
       if (!signatures) {
         res
@@ -842,23 +834,23 @@ app.get(
 
       console.log(`Signature: ${signatures}`);
 
-      const userOphash = await smartAccountClient.sendUserOperation({
-        ...userop,
+      const userOpHash = await smartAccountClient.sendUserOperation({
+        ...userOp,
         signature: signatures,
       });
 
-      console.log(`User operation hash: ${userOphash}`);
+      console.log(`User operation hash: ${userOpHash}`);
 
       const txHash = await smartAccountClient.waitForUserOperationReceipt({
-        hash: userOphash,
+        hash: userOpHash,
       });
 
       console.log(`Transaction hash: ${txHash.receipt.transactionHash}`);
 
-      if (k1_session in state) {
-        state[k1_session].sse.send({ type: "commit", k1_tx });
+      if (sessionK1 in state) {
+        state[sessionK1].sse.send({ type: "commit", userOpK1 });
 
-        delete state[k1_session].txs[k1_tx];
+        delete state[sessionK1].userOps[userOpK1];
       } else {
         res
           .status(422)

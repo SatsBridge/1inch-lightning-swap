@@ -13,8 +13,9 @@
     "@types/node": "^24.1.0",
     "babel-loader": "^10.0.0",
     "babel-plugin-polyfill-corejs3": "^0.13.0",
-    "lnurl": "^0.27.0",
+    "eventsource": "^4.0.0",
     "transform-async-modules-webpack-plugin": "^1.1.1",
+    "typescript": "^5.9.2",
     "webpack": "^5.100.2",
     "webpack-cli": "^6.0.1"
   },
@@ -36,6 +37,7 @@
   },
   "scripts": {
     "build": "NODE_ENV=development webpack",
-    "start": "NODE_ENV=development node dist/main.mjs"
+    "server": "NODE_ENV=development node dist/server.mjs",
+    "client": "NODE_ENV=development node dist/client.mjs"
   }
 }
