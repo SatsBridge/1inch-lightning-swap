@@ -1,35 +1,35 @@
 import { createSmartAccountClient, toOwner } from "permissionless";
 import { createPimlicoClient } from "permissionless/clients/pimlico";
 import {
+  Account,
+  AccountSource,
+  Address,
+  encodePacked,
   extractChain,
+  concat,
   concatHex,
   createPublicClient,
-  getContract,
-  http,
-  parseEther,
-  zeroAddress,
-  Hex,
-  toHex,
-  pad,
-  concat,
-  Address,
-  UnionPartialBy,
-  OneOf,
-  EIP1193Provider,
-  LocalAccount,
-  WalletClient,
-  Transport,
-  Account,
-  encodePacked,
-  fromHex,
-  AccountSource,
-  JsonRpcAccount,
   CustomSource,
+  EIP1193Provider,
+  fromHex,
+  getContract,
+  Hex,
+  http,
   InvalidAddressError,
   isAddress,
+  JsonRpcAccount,
+  LocalAccount,
   numberToHex,
-  serializeSignature,
+  OneOf,
+  pad,
+  parseEther,
   recoverPublicKey,
+  serializeSignature,
+  toHex,
+  Transport,
+  UnionPartialBy,
+  WalletClient,
+  zeroAddress,
 } from "viem";
 import {
   entryPoint06Abi,
@@ -39,6 +39,7 @@ import {
   PrepareUserOperationReturnType,
   SmartAccount,
   UserOperation,
+  WaitForUserOperationReceiptReturnType,
 } from "viem/account-abstraction";
 import { privateKeyToAccount, publicKeyToAddress } from "viem/accounts";
 import {
@@ -59,6 +60,8 @@ import { bech32 } from "bech32";
 import { webcrypto } from "node:crypto";
 import { secp256k1 } from "@noble/curves/secp256k1";
 import "dotenv/config";
+import { isNone, none, Option, some } from "fp-ts/lib/Option";
+import { unsafeUnwrap } from "fp-ts-std/Option";
 
 const EIP712_SAFE_OPERATION_TYPE_V06 = {
   SafeOp: [
@@ -376,10 +379,74 @@ function toLnurl(url: string) {
     .toUpperCase();
 }
 
-let state: State<"0.7", undefined, unknown[], any, undefined> = {};
+function traverse(
+  obj: object,
+  filter: (path: string) => boolean,
+  transform: (value: unknown) => unknown,
+  path: string = "",
+): object {
+  const newObj = {};
+
+  for (const key in obj) {
+    let keyPath: string;
+
+    if (path === "") {
+      keyPath = key;
+    } else {
+      keyPath = `${path}.${key}`;
+    }
+
+    if (!filter(keyPath)) {
+      continue;
+    }
+
+    const child = obj[key];
+
+    if (typeof child === "object") {
+      newObj[key] = traverse(child, filter, transform, keyPath);
+    } else if (typeof child !== "function") {
+      newObj[key] = transform(child);
+    }
+  }
+
+  return newObj;
+}
+
+function safeAccountParamsTransform<
+  entryPointVersion extends "0.6" | "0.7",
+  TErc7579 extends Address | undefined,
+>(
+  safeAccountParams: ToSafeSmartAccountParameters<entryPointVersion, TErc7579>,
+): object {
+  return traverse(
+    safeAccountParams,
+    (path) => {
+      if (path === "client") {
+        return false;
+      }
+
+      return true;
+    },
+    (value) => {
+      if (typeof value === "bigint") {
+        return value.toString() + "n";
+      }
+
+      return value;
+    },
+  );
+}
+
+const entryPointVersion = "0.7";
+const state: State<
+  typeof entryPointVersion,
+  undefined,
+  unknown[],
+  any,
+  undefined
+> = {};
 const serviceOwner = privateKeyToAccount(`0x${process.env.SERVICE_KEY!}`);
 const ownersThreshold = 2n;
-const entryPointVersion = "0.7";
 const chainId = 11155111;
 const safeVersion = "1.4.1";
 const chain = extractChain({
@@ -403,34 +470,117 @@ const app = express();
 
 app.use(cors());
 
-app.get("/vault/userOp", (req, res) => {
-  const sessionK1Material = new Uint8Array(32);
+app.get(
+  "/vault/userOp",
+  (
+    req: TypedRequest<{
+      prepare?: "yes" | "no" | string | any;
+      calls?: string | any;
+    }>,
+    res,
+  ) => {
+    let { prepare: isPrepareUserOp, calls } = req.query;
 
-  webcrypto.getRandomValues(sessionK1Material);
+    if (isPrepareUserOp !== undefined && typeof isPrepareUserOp !== "string") {
+      res
+        .status(422)
+        .send({ status: "ERROR", reason: "Invalid prepare query type" });
 
-  const sessionK1 = toHex(sessionK1Material).slice(2);
-  const url = new URL(
-    `${req.protocol}://${process.env.HOST ?? req.host}/vault/userOp/loginAndPrepare?tag=login&k1=${sessionK1}&action=register`,
-  );
-  const lnurl = toLnurl(url.toString());
-  const sse = new SSE();
+      return;
+    }
 
-  state[sessionK1] = { sse, userOps: {} };
+    if (
+      typeof isPrepareUserOp === "string" &&
+      isPrepareUserOp !== "yes" &&
+      isPrepareUserOp !== "no"
+    ) {
+      res
+        .status(422)
+        .send({ status: "ERROR", reason: "Unknown prepare query value" });
 
-  req.on("close", () => {
-    delete state[sessionK1];
-  });
-  sse.init(req, res);
-  sse.send({ sessionK1: sessionK1, lnurl });
-});
+      return;
+    }
+
+    if (calls !== undefined && isPrepareUserOp === "no") {
+      res.status(422).send({
+        status: "ERROR",
+        reason: "Query calls and prepare=no incompatible",
+      });
+    }
+
+    if (calls !== undefined && typeof calls !== "string") {
+      res
+        .status(422)
+        .send({ status: "ERROR", reason: "Invalid calls query type" });
+
+      return;
+    }
+
+    const sessionK1Material = new Uint8Array(32);
+
+    webcrypto.getRandomValues(sessionK1Material);
+
+    const sessionK1 = toHex(sessionK1Material).slice(2);
+
+    if (sessionK1 in state) {
+      res
+        .status(500)
+        .send({ status: "ERROR", reason: "Internal server error" });
+
+      throw new Error("Session exist");
+    }
+
+    const baseUrl = `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/userOp`;
+    let url: URL;
+
+    if (isPrepareUserOp === undefined || isPrepareUserOp === "yes") {
+      if (isPrepareUserOp === undefined) {
+        isPrepareUserOp = "yes";
+      }
+
+      if (calls === undefined) {
+        url = new URL(
+          `${baseUrl}/login?tag=login&k1=${sessionK1}&action=register&_ext_sb_prepare=${isPrepareUserOp}`,
+        );
+      } else {
+        url = new URL(
+          `${baseUrl}/login?tag=login&k1=${sessionK1}&action=register&_ext_sb_prepare=${isPrepareUserOp}&_ext_sb_calls=${calls}`,
+        );
+      }
+    } else if (isPrepareUserOp === "no") {
+      url = new URL(
+        `${baseUrl}/login?tag=login&k1=${sessionK1}&action=register&_ext_sb_prepare=${isPrepareUserOp}`,
+      );
+    } else {
+      throw new Error("Unreachable"); // make TypeScript linter happy
+    }
+
+    const lnurl = toLnurl(url.toString());
+    const sse = new SSE();
+
+    state[sessionK1] = { sse, userOps: {} };
+
+    req.on("close", () => {
+      delete state[sessionK1];
+    });
+    sse.init(req, res);
+    sse.send({ type: "init", sessionK1: sessionK1, lnurl });
+  },
+);
 
 async function prepareUserOp(
   sessionK1: string,
-  counterpartyKey: string,
   counterpartyAddress: Address,
+  calls: unknown[],
   req: Request,
+  res: Response,
 ): Promise<{
   userOpK1: string;
+  safeAccountParams: ToSafeSmartAccountParameters<
+    typeof entryPointVersion,
+    undefined
+  >;
+  address: string;
   lnurl: string;
 }> {
   const counterpartyOwner = toAccount(
@@ -438,21 +588,29 @@ async function prepareUserOp(
       address: counterpartyAddress,
 
       async signMessage(_message) {
-        throw Error("Not supported");
+        throw new Error("Not supported");
       },
 
       async signTransaction(_transaction, _options) {
-        throw Error("Not supported");
+        throw new Error("Not supported");
       },
 
       async signTypedData(_typedData) {
-        throw Error("Not supported");
+        throw new Error("Not supported");
       },
     },
 
     "public",
   );
   const owners = [serviceOwner, counterpartyOwner];
+  const {
+    safeModuleSetupAddress,
+    safe4337ModuleAddress,
+    safeProxyFactoryAddress,
+    safeSingletonAddress,
+    multiSendAddress,
+    multiSendCallOnlyAddress,
+  } = getDefaultAddresses(safeVersion, entryPointVersion, {});
   const safeAccountParams = {
     client: publicClient,
     entryPoint: {
@@ -463,6 +621,12 @@ async function prepareUserOp(
     saltNonce: 0n,
     threshold: ownersThreshold,
     version: safeVersion,
+    safeModuleSetupAddress,
+    safe4337ModuleAddress,
+    safeProxyFactoryAddress,
+    safeSingletonAddress,
+    multiSendAddress,
+    multiSendCallOnlyAddress,
   } as ToSafeSmartAccountParameters<typeof entryPointVersion, undefined>;
   const safeAccount = await toSafeSmartAccount(safeAccountParams);
   const smartAccountClient = createSmartAccountClient({
@@ -478,58 +642,203 @@ async function prepareUserOp(
     },
   });
   const userOp = await smartAccountClient.prepareUserOperation({
-    calls: [
-      {
-        to: zeroAddress,
-        value: 0,
-        data: "0x",
-      },
-    ],
+    calls,
   });
   const userOpHash = await hashUserOperation(safeAccountParams, userOp);
   const userOpK1 = userOpHash.slice(2);
+  const { userOps } = state[sessionK1];
 
-  Object.assign(state[sessionK1], {
-    counterpartyKey,
-  });
-  state[sessionK1].userOps[userOpK1] = {
+  if (userOpK1 in userOps) {
+    res.status(500).json({ status: "ERROR", reason: "Internal server error" });
+
+    throw new Error("UserOp exist");
+  }
+
+  userOps[userOpK1] = {
     safeAccountParams,
     userOp,
   };
 
   const url = new URL(
-    `${req.protocol}://${process.env.HOST ?? req.host}/vault/userOp/commit/${sessionK1}?tag=login&k1=${userOpK1}&action=auth`,
+    `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/userOp/commit/${sessionK1}?tag=login&k1=${userOpK1}&action=auth`,
   );
   const lnurl = toLnurl(url.toString());
 
-  return { userOpK1, lnurl };
+  return { userOpK1, safeAccountParams, address: safeAccount.address, lnurl };
+}
+
+function parseCalls(
+  encodedCalls: string | undefined,
+  res: Response,
+): Option<unknown[]> {
+  if (encodedCalls !== undefined && typeof encodedCalls !== "string") {
+    res
+      .status(422)
+      .send({ status: "ERROR", reason: "Invalid _ext_sb_calls query type" });
+
+    return none;
+  }
+
+  let calls: unknown[];
+
+  if (encodedCalls !== undefined) {
+    let decodedCalls: string;
+
+    try {
+      decodedCalls = decodeURIComponent(encodedCalls);
+    } catch (e) {
+      if (e instanceof URIError) {
+        res.status(422).send({
+          status: "ERROR",
+          reason: `Can't decode _ext_sb_calls: ${e.toString()}`,
+        });
+
+        return none;
+      }
+
+      res
+        .status(500)
+        .json({ status: "ERROR", reason: "Internal server error" });
+
+      throw e;
+    }
+
+    try {
+      calls = JSON.parse(decodedCalls);
+    } catch (e) {
+      if (e instanceof SyntaxError) {
+        res.status(422).send({
+          status: "ERROR",
+          reason: `Can't deserialize _ext_sb_calls: ${e.toString()}`,
+        });
+
+        return none;
+      }
+
+      res
+        .status(500)
+        .json({ status: "ERROR", reason: "Internal server error" });
+
+      throw e;
+    }
+
+    if (!Array.isArray(calls)) {
+      return none;
+    }
+  } else {
+    calls = [
+      {
+        to: zeroAddress,
+        value: 0,
+        data: "0x",
+      },
+    ];
+  }
+
+  return some(calls);
 }
 
 app.get(
-  "/vault/userOp/loginAndPrepare",
+  "/vault/userOp/login",
   async (
-    req: TypedRequest<{ k1?: string; key?: string; sig?: string }>,
+    req: TypedRequest<{
+      k1?: string | any;
+      key?: string | any;
+      sig?: string | any;
+      _ext_sb_prepare?: "yes" | "no" | string | any;
+      _ext_sb_calls?: string | any;
+    }>,
     res,
   ) => {
-    const { k1: sessionK1, key: counterpartyKey, sig: signature } = req.query;
+    const {
+      k1: sessionK1,
+      key: counterpartyKey,
+      sig: signature,
+      _ext_sb_prepare: isPrepareUserOp,
+      _ext_sb_calls: encodedCalls,
+    } = req.query;
 
     if (sessionK1 === undefined) {
-      res.status(400).send({ status: "ERROR", reason: "Missing k1" });
+      res.status(422).json({ status: "ERROR", reason: "Missing k1" });
+
+      return;
+    }
+
+    if (typeof sessionK1 !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid k1 query type",
+      });
 
       return;
     }
 
     if (counterpartyKey === undefined) {
-      res.status(400).send({ status: "ERROR", reason: "Missing key" });
+      res.status(422).json({ status: "ERROR", reason: "Missing key" });
+
+      return;
+    }
+
+    if (typeof counterpartyKey !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid key query type",
+      });
 
       return;
     }
 
     if (signature === undefined) {
-      res.status(400).send({ status: "ERROR", reason: "Missing sig" });
+      res.status(422).json({ status: "ERROR", reason: "Missing sig" });
 
       return;
     }
+
+    if (typeof signature !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid sig query type",
+      });
+
+      return;
+    }
+
+    if (isPrepareUserOp !== undefined && typeof isPrepareUserOp !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid _ext_sb_prepare query type",
+      });
+
+      return;
+    }
+
+    if (
+      typeof isPrepareUserOp === "string" &&
+      isPrepareUserOp !== "yes" &&
+      isPrepareUserOp !== "no"
+    ) {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Unknown _ext_sb_prepare query value",
+      });
+
+      return;
+    }
+
+    if (encodedCalls !== undefined && isPrepareUserOp === "no") {
+      res.status(422).send({
+        status: "ERROR",
+        reason: "Query _ext_sb_calls and _ext_sb_prepare=no incompatible",
+      });
+    }
+
+    const maybeCalls = parseCalls(encodedCalls, res);
+
+    if (isNone(maybeCalls)) {
+      return;
+    }
+
+    const calls = unsafeUnwrap(maybeCalls);
 
     let counterpartyAddress: Address;
 
@@ -541,13 +850,13 @@ app.get(
         `0x${uncompressedCounterpartyKey}`,
       );
     } catch (_) {
-      res.status(422).send({ status: "ERROR", reason: "Invalid key" });
+      res.status(422).json({ status: "ERROR", reason: "Invalid key" });
 
       return;
     }
 
     if (
-      secp256k1.verify(
+      !secp256k1.verify(
         fromHex(`0x${signature}`, "bytes"),
         fromHex(`0x${sessionK1}`, "bytes"),
         fromHex(`0x${counterpartyKey}`, "bytes"),
@@ -557,117 +866,189 @@ app.get(
         },
       )
     ) {
-      const { userOpK1, lnurl } = await prepareUserOp(
-        sessionK1,
-        counterpartyKey,
-        counterpartyAddress,
-        req,
-      );
+      res.status(422).json({ status: "ERROR", reason: "Invalid sig" });
 
-      if (sessionK1 in state) {
-        state[sessionK1].sse.send({
-          type: "loginAndPrepare",
-          userOpK1,
-          counterpartyKey,
-          lnurl,
-        });
-      } else {
-        res
-          .status(422)
-          .send({ status: "ERROR", reason: "Session dont't exist" });
-
-        return;
-      }
-
-      res.send({ status: "OK" });
-    } else {
-      res.status(422).send({ status: "ERROR", reason: "Invalid sig" });
+      return;
     }
+
+    if (!(sessionK1 in state)) {
+      res.status(422).json({ status: "ERROR", reason: "Session dont't exist" });
+
+      return;
+    }
+
+    const { sse, counterpartyKey: counterpartyKeyInSession } = state[sessionK1];
+
+    if (
+      counterpartyKeyInSession !== undefined &&
+      counterpartyKey !== counterpartyKeyInSession
+    ) {
+      res
+        .status(422)
+        .json({ status: "ERROR", reason: "Incorrect target session" });
+
+      return;
+    }
+
+    const notification = {};
+    const prepareUrl = new URL(
+      `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/userOp/prepare/${sessionK1}`,
+    );
+
+    if (isPrepareUserOp === undefined || isPrepareUserOp === "yes") {
+      const { userOpK1, safeAccountParams, address, lnurl } =
+        await prepareUserOp(sessionK1, counterpartyAddress, calls, req, res);
+      const safeAccountParamsTrans =
+        safeAccountParamsTransform(safeAccountParams);
+
+      Object.assign(notification, {
+        type: "loginedAndPrepare",
+        userOpK1,
+        counterpartyKey,
+        safeAccountParams: safeAccountParamsTrans,
+        address,
+        prepareUrl,
+        lnurl,
+      });
+    } else if (isPrepareUserOp === "no") {
+      Object.assign(notification, {
+        type: "logined",
+        counterpartyKey,
+        prepareUrl,
+      });
+    } else {
+      throw new Error("Unreachable"); // make TypeScript linter happy
+    }
+
+    Object.assign(state[sessionK1], {
+      counterpartyKey,
+    });
+    sse.send(notification);
+    res.json({ status: "OK" });
   },
 );
 
-app.get("/vault/userOp/prepare/:sessionK1", async (req, res) => {
-  const { sessionK1 } = req.params;
+app.get(
+  "/vault/userOp/prepare/:sessionK1",
+  async (
+    req: TypedRequest<{
+      calls?: string | any;
+    }>,
+    res,
+  ) => {
+    const { sessionK1 } = req.params;
+    const { calls: encodedCalls } = req.query;
 
-  if (!(sessionK1 in state)) {
-    res.status(422).send({ status: "ERROR", reason: "Session dont't exist" });
+    if (!(sessionK1 in state)) {
+      res.status(422).json({ status: "ERROR", reason: "Session dont't exist" });
 
-    return;
-  }
+      return;
+    }
 
-  const { counterpartyKey } = state[sessionK1];
+    const { counterpartyKey } = state[sessionK1];
 
-  if (counterpartyKey === undefined) {
-    res.status(422).send({ status: "ERROR", reason: "Key don't revealed" });
+    if (counterpartyKey === undefined) {
+      res.status(422).json({ status: "ERROR", reason: "Key don't revealed" });
 
-    return;
-  }
+      return;
+    }
 
-  let counterpartyAddress: Address;
+    const maybeCalls = parseCalls(encodedCalls, res);
 
-  try {
-    const uncompressedCounterpartyKey =
-      secp256k1.Point.fromHex(counterpartyKey).toHex(false);
+    if (isNone(maybeCalls)) {
+      return;
+    }
 
-    counterpartyAddress = publicKeyToAddress(
-      `0x${uncompressedCounterpartyKey}`,
+    const calls = unsafeUnwrap(maybeCalls);
+
+    let counterpartyAddress: Address;
+
+    try {
+      const uncompressedCounterpartyKey =
+        secp256k1.Point.fromHex(counterpartyKey).toHex(false);
+
+      counterpartyAddress = publicKeyToAddress(
+        `0x${uncompressedCounterpartyKey}`,
+      );
+    } catch (_) {
+      res.status(422).json({ status: "ERROR", reason: "Invalid key" });
+
+      return;
+    }
+
+    const { userOpK1, safeAccountParams, address, lnurl } = await prepareUserOp(
+      sessionK1,
+      counterpartyAddress,
+      calls,
+      req,
+      res,
     );
-  } catch (_) {
-    res.status(422).send({ status: "ERROR", reason: "Invalid key" });
+    const safeAccountParamsTrans =
+      safeAccountParamsTransform(safeAccountParams);
 
-    return;
-  }
-
-  const { userOpK1, lnurl } = await prepareUserOp(
-    sessionK1,
-    counterpartyKey,
-    counterpartyAddress,
-    req,
-  );
-
-  res.send({ userOpK1, lnurl });
-});
+    res.json({
+      userOpK1,
+      safeAccountParams: safeAccountParamsTrans,
+      address,
+      lnurl,
+    });
+  },
+);
 
 app.get(
   "/vault/userOp/commit/:sessionK1",
   async (
-    req: TypedRequest<{ k1?: string; key?: string; sig?: string }>,
+    req: TypedRequest<{
+      k1?: string | any;
+      key?: string | any;
+      sig?: string | any;
+    }>,
     res,
   ) => {
     const { sessionK1 } = req.params;
     const { k1: userOpK1, key: counterpartyKey, sig: signature } = req.query;
 
     if (userOpK1 === undefined) {
-      res.status(400).send({ status: "ERROR", reason: "Missing k1" });
+      res.status(422).json({ status: "ERROR", reason: "Missing k1" });
+
+      return;
+    }
+
+    if (typeof userOpK1 !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid k1 query type",
+      });
 
       return;
     }
 
     if (counterpartyKey === undefined) {
-      res.status(400).send({ status: "ERROR", reason: "Missing key" });
+      res.status(422).json({ status: "ERROR", reason: "Missing key" });
+
+      return;
+    }
+
+    if (typeof counterpartyKey !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid key query type",
+      });
 
       return;
     }
 
     if (signature === undefined) {
-      res.status(400).send({ status: "ERROR", reason: "Missing sig" });
+      res.status(422).json({ status: "ERROR", reason: "Missing sig" });
 
       return;
     }
 
-    if (!(sessionK1 in state)) {
-      res.status(422).send({ status: "ERROR", reason: "Session dont't exist" });
-
-      return;
-    }
-
-    const { counterpartyKey: counterpartyKeyInSession, userOps } =
-      state[sessionK1];
-
-    if (counterpartyKey !== counterpartyKeyInSession) {
-      res
-        .status(422)
-        .send({ status: "ERROR", reason: "Incorrect target session" });
+    if (typeof signature !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid sig query type",
+      });
 
       return;
     }
@@ -683,13 +1064,13 @@ app.get(
         `0x${uncompressedCounterpartyKey}`,
       );
     } catch (_) {
-      res.status(422).send({ status: "ERROR", reason: "Invalid key" });
+      res.status(422).json({ status: "ERROR", reason: "Invalid key" });
 
       return;
     }
 
     if (
-      secp256k1.verify(
+      !secp256k1.verify(
         fromHex(`0x${signature}`, "bytes"),
         fromHex(`0x${userOpK1}`, "bytes"),
         fromHex(`0x${counterpartyKey}`, "bytes"),
@@ -699,173 +1080,193 @@ app.get(
         },
       )
     ) {
-      if (!(userOpK1 in userOps)) {
+      res.status(422).json({ status: "ERROR", reason: "Invalid sig" });
+
+      return;
+    }
+
+    if (!(sessionK1 in state)) {
+      res.status(422).json({ status: "ERROR", reason: "Session dont't exist" });
+
+      return;
+    }
+
+    const {
+      sse,
+      counterpartyKey: counterpartyKeyInSession,
+      userOps,
+    } = state[sessionK1];
+
+    if (counterpartyKey !== counterpartyKeyInSession) {
+      res
+        .status(422)
+        .json({ status: "ERROR", reason: "Incorrect target session" });
+
+      return;
+    }
+
+    if (!(userOpK1 in userOps)) {
+      res.status(422).json({ status: "ERROR", reason: "UserOp dont't exist" });
+
+      return;
+    }
+
+    const { safeAccountParams, userOp } = userOps[userOpK1];
+    const { owners } = safeAccountParams;
+    const localOwners = await Promise.all(
+      owners
+        .filter((owner) => {
+          if ("type" in owner && owner.type === "local") {
+            return true;
+          }
+
+          if ("request" in owner) {
+            return true;
+          }
+
+          if ("account" in owner) {
+            // walletClient
+            return true;
+          }
+
+          return false;
+        })
+        .map((owner) =>
+          toOwner({
+            owner: owner as OneOf<
+              | LocalAccount
+              | EthereumProvider
+              | WalletClient<Transport, Chain | undefined, Account>
+            >,
+          }),
+        ),
+    );
+    const safeAccount = await toSafeSmartAccount(safeAccountParams);
+    const smartAccountClient = createSmartAccountClient({
+      account: safeAccount,
+      bundlerTransport: http(
+        `https://api.pimlico.io/v2/${chainId}/rpc?apikey=${apiKey}`,
+      ),
+      chain,
+      paymaster: paymasterClient,
+      userOperation: {
+        estimateFeesPerGas: async () =>
+          (await paymasterClient.getUserOperationGasPrice()).fast,
+      },
+    });
+
+    if (localOwners.length < ownersThreshold - 1n) {
+      res
+        .status(500)
+        .json({ status: "ERROR", reason: "Internal server error" });
+
+      throw new Error(
+        "Owners length mismatch use SafeSmartAccount.signUserOperation from `permissionless/accounts/safe`",
+      );
+    }
+
+    const { r, s } = secp256k1.Signature.fromHex(signature, "der");
+    let ethSignature: Hex;
+
+    for (let yParity = 0; yParity <= 1; yParity++) {
+      ethSignature = serializeSignature({
+        r: numberToHex(r, { size: 32 }),
+        s: numberToHex(s, { size: 32 }),
+        yParity,
+        to: "hex",
+      });
+
+      const recoveredCounterpartyKey = (
+        await recoverPublicKey({
+          hash: `0x${userOpK1}`,
+          signature: ethSignature,
+        })
+      ).slice(2);
+
+      if (recoveredCounterpartyKey === uncompressedCounterpartyKey) {
+        break;
+      } else if (yParity === 1) {
         res
-          .status(422)
-          .send({ status: "ERROR", reason: "UserOp dont't exist" });
+          .status(500)
+          .json({ status: "ERROR", reason: "Internal server error" });
+
+        throw new Error("No valid signature");
+      }
+    }
+
+    const { validAfter = 0, validUntil = 0 } = safeAccountParams;
+    let unPackedSignatures = [
+      {
+        signer: counterpartyAddress,
+        data: ethSignature!,
+      },
+    ];
+
+    if (unPackedSignatures.length < ownersThreshold) {
+      for (const owner of localOwners) {
+        if (owner.sign === undefined) {
+          continue;
+        }
+
+        unPackedSignatures.push({
+          signer: owner.address,
+          data: await owner.sign({ hash: `0x${userOpK1}` }),
+        });
+
+        if (BigInt(unPackedSignatures.length) === ownersThreshold) {
+          break;
+        }
+      }
+    }
+
+    unPackedSignatures.sort((left, right) =>
+      left.signer.toLowerCase().localeCompare(right.signer.toLowerCase()),
+    );
+
+    const signatures = encodePacked(
+      ["uint48", "uint48", "bytes"],
+      [
+        validAfter,
+        validUntil,
+        concat(unPackedSignatures.map((signature) => signature.data)),
+      ],
+    );
+
+    console.log(`Signature: ${signatures}`);
+
+    const userOpHash = await smartAccountClient.sendUserOperation({
+      ...userOp,
+      signature: signatures,
+    });
+
+    console.log(`User operation hash: ${userOpHash}`);
+
+    setTimeout(async () => {
+      let txHash: WaitForUserOperationReceiptReturnType;
+
+      try {
+        txHash = await smartAccountClient.waitForUserOperationReceipt({
+          hash: userOpHash,
+        });
+      } catch (_) {
+        sse.send({ type: "error", action: "commit", userOpK1 });
 
         return;
       }
-
-      const { safeAccountParams, userOp } = userOps[userOpK1];
-      const { owners } = safeAccountParams;
-      const localOwners = await Promise.all(
-        owners
-          .filter((owner) => {
-            if ("type" in owner && owner.type === "local") {
-              return true;
-            }
-
-            if ("request" in owner) {
-              return true;
-            }
-
-            if ("account" in owner) {
-              // walletClient
-              return true;
-            }
-
-            return false;
-          })
-          .map((owner) =>
-            toOwner({
-              owner: owner as OneOf<
-                | LocalAccount
-                | EthereumProvider
-                | WalletClient<Transport, Chain | undefined, Account>
-              >,
-            }),
-          ),
-      );
-      const safeAccount = await toSafeSmartAccount(safeAccountParams);
-      const smartAccountClient = createSmartAccountClient({
-        account: safeAccount,
-        bundlerTransport: http(
-          `https://api.pimlico.io/v2/${chainId}/rpc?apikey=${apiKey}`,
-        ),
-        chain,
-        paymaster: paymasterClient,
-        userOperation: {
-          estimateFeesPerGas: async () =>
-            (await paymasterClient.getUserOperationGasPrice()).fast,
-        },
-      });
-
-      if (localOwners.length < ownersThreshold - 1n) {
-        res
-          .status(500)
-          .send({ status: "ERROR", reason: "Internal server error" });
-
-        throw new Error(
-          "Owners length mismatch use SafeSmartAccount.signUserOperation from `permissionless/accounts/safe`",
-        );
-      }
-
-      const { r, s } = secp256k1.Signature.fromHex(signature, "der");
-      let ethSignature: Hex | null = null;
-
-      for (let yParity = 0; yParity <= 1; yParity++) {
-        ethSignature = serializeSignature({
-          r: numberToHex(r, { size: 32 }),
-          s: numberToHex(s, { size: 32 }),
-          yParity,
-          to: "hex",
-        });
-
-        const recoveredCounterpartyKey = (
-          await recoverPublicKey({
-            hash: `0x${userOpK1}`,
-            signature: ethSignature,
-          })
-        ).slice(2);
-
-        if (recoveredCounterpartyKey === uncompressedCounterpartyKey) {
-          break;
-        } else if (yParity === 1) {
-          res
-            .status(500)
-            .send({ status: "ERROR", reason: "Internal server error" });
-
-          throw new Error("No valid signature");
-        }
-      }
-
-      const { validAfter = 0, validUntil = 0 } = safeAccountParams;
-      let unPackedSignatures = [
-        {
-          signer: counterpartyAddress,
-          data: ethSignature!,
-        },
-      ];
-
-      if (unPackedSignatures.length < ownersThreshold) {
-        for (const owner of localOwners) {
-          unPackedSignatures.push({
-            signer: owner.address,
-            data: await owner.sign!({ hash: `0x${userOpK1}` }),
-          });
-
-          if (BigInt(unPackedSignatures.length) === ownersThreshold) {
-            break;
-          }
-        }
-      }
-
-      unPackedSignatures.sort((left, right) =>
-        left.signer.toLowerCase().localeCompare(right.signer.toLowerCase()),
-      );
-
-      const signatures = encodePacked(
-        ["uint48", "uint48", "bytes"],
-        [
-          validAfter,
-          validUntil,
-          concat(unPackedSignatures.map((signature) => signature.data)),
-        ],
-      );
-
-      if (!signatures) {
-        res
-          .status(500)
-          .send({ status: "ERROR", reason: "Internal server error" });
-
-        throw new Error("No signatures found");
-      }
-
-      console.log(`Signature: ${signatures}`);
-
-      const userOpHash = await smartAccountClient.sendUserOperation({
-        ...userOp,
-        signature: signatures,
-      });
-
-      console.log(`User operation hash: ${userOpHash}`);
-
-      const txHash = await smartAccountClient.waitForUserOperationReceipt({
-        hash: userOpHash,
-      });
 
       console.log(`Transaction hash: ${txHash.receipt.transactionHash}`);
 
-      if (sessionK1 in state) {
-        state[sessionK1].sse.send({ type: "commit", userOpK1 });
-
-        delete state[sessionK1].userOps[userOpK1];
-      } else {
-        res
-          .status(422)
-          .send({ status: "ERROR", reason: "Session dont't exist" });
-
-        return;
-      }
-
-      res.send({ status: "OK" });
-    } else {
-      res.status(422).send({ status: "ERROR", reason: "Invalid sig" });
-    }
+      sse.send({ type: "commited", userOpK1 });
+    });
+    setTimeout(() => {
+      delete userOps[userOpK1];
+    }, 1_800_000); // clear after 30 min
+    res.json({ status: "OK" });
   },
 );
 
 app.use(morgan("combined"));
+
+app.set("trust proxy", true);
 
 app.listen(process.env.PORT ?? 8000);

@@ -8,15 +8,36 @@ function fromLnurl(url: string): string {
   ).toString("utf-8");
 }
 
-let state = "init";
+function bigIntReviver(key: string, value: unknown): unknown {
+  if (typeof value === "string" && /^\d+n$/.test(value)) {
+    return BigInt(value.slice(0, -1));
+  }
+
+  return value;
+}
+
+const state = {
+  stage: "init",
+  sessionK1: null,
+  counterpartyKey: null,
+  userOps: {},
+};
 const { secretKey, publicKey } = secp256k1.keygen();
 const key = secp256k1.Point.fromBytes(publicKey).toHex(true);
 const es = new EventSource("http://localhost:8091/vault/userOp");
 
 es.addEventListener("message", async (event) => {
-  switch (state) {
+  const { stage } = state;
+  const notify = JSON.parse(event.data);
+
+  switch (notify.type) {
     case "init": {
-      const { sessionK1, lnurl } = JSON.parse(event.data);
+      const { sessionK1, lnurl } = notify;
+
+      if (stage !== "init") {
+        throw Error("Invalid state transition");
+      }
+
       const url = fromLnurl(lnurl);
       const signature = secp256k1
         .sign(sessionK1, secretKey, {
@@ -25,7 +46,6 @@ es.addEventListener("message", async (event) => {
           extraEntropy: true,
         })
         .toHex("der");
-
       const { status, reason } = await (
         await fetch(`${url}&key=${key}&sig=${signature}`)
       ).json();
@@ -36,17 +56,31 @@ es.addEventListener("message", async (event) => {
         throw Error("Unknown status");
       }
 
-      state = "loginAndPrepare";
+      Object.assign(state, { stage: "loginAndPrepare", sessionK1 });
 
       break;
     }
-    case "loginAndPrepare": {
-      const { type, userOpK1, lnurl } = JSON.parse(event.data);
+    case "loginedAndPrepare": {
+      const { userOpK1, counterpartyKey, safeAccountParams, lnurl } =
+        JSON.parse(event.data, bigIntReviver);
 
-      if (type !== "loginAndPrepare") {
-        throw Error("Invalid state");
+      console.log(safeAccountParams);
+
+      if (stage !== "loginAndPrepare") {
+        throw Error("Invalid state transition");
       }
 
+      Object.assign(state, { stage: "logined", counterpartyKey });
+
+      const { userOps } = state;
+
+      if (userOpK1 in userOps) {
+        throw Error("UserOp exist");
+      }
+
+      userOps[userOpK1] = { stage: "prepare" };
+
+      const userOp = userOps[userOpK1];
       const url = fromLnurl(lnurl);
       const signature = secp256k1
         .sign(userOpK1, secretKey, {
@@ -66,18 +100,45 @@ es.addEventListener("message", async (event) => {
         throw Error("Unknown status");
       }
 
-      state = "commit";
+      userOp.stage = "commit";
 
       break;
     }
-    case "commit": {
-      const { type, userOpK1 } = JSON.parse(event.data);
+    case "commited": {
+      const { userOpK1 } = notify;
+      const userOp = state.userOps[userOpK1];
 
-      if (type !== "commit") {
-        throw Error("Invalid state");
+      if (stage !== "logined") {
+        throw Error("Invalid state transition");
       }
 
-      state = "final";
+      if (userOp.stage !== "commit") {
+        throw Error("Invalid state transition");
+      }
+
+      userOp.stage = "commited";
+
+      break;
+    }
+    case "error": {
+      switch (notify.action) {
+        case "commit": {
+          const { userOpK1 } = notify;
+          const userOp = state.userOps[userOpK1];
+
+          if (stage !== "logined") {
+            throw Error("Invalid state transition");
+          }
+
+          if (userOp.stage !== "commit") {
+            throw Error("Invalid state transition");
+          }
+
+          userOp.stage = "error";
+
+          break;
+        }
+      }
     }
   }
 });

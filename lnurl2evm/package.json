@@ -29,6 +29,8 @@
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "express-sse": "^1.0.0",
+    "fp-ts": "^2.16.10",
+    "fp-ts-std": "^1.0.0",
     "morgan": "^1.10.1",
     "ox": "^0.6.7",
     "permissionless": "^0.2.52",
