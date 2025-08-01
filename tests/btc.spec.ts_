@@ -1,0 +1,526 @@
+import 'dotenv/config'
+import {expect, jest} from '@jest/globals'
+
+import {createServer, CreateServerReturnType} from 'prool'
+import {anvil} from 'prool/instances'
+
+import Sdk from '@1inch/cross-chain-sdk'
+import {
+    computeAddress,
+    ContractFactory,
+    JsonRpcProvider,
+    MaxUint256,
+    parseEther,
+    parseUnits,
+    randomBytes,
+    Wallet as SignerWallet
+} from 'ethers'
+import {uint8ArrayToHex, UINT_40_MAX} from '@1inch/byte-utils'
+import assert from 'node:assert'
+import {ChainConfig, config} from './config'
+import {Wallet} from './wallet'
+import {Resolver} from './resolver'
+import {EscrowFactory} from './escrow-factory'
+import factoryContract from '../dist/contracts/TestEscrowFactory.sol/TestEscrowFactory.json'
+import resolverContract from '../dist/contracts/Resolver.sol/Resolver.json'
+
+import {CLNRawSocketClient} from './cln.js'
+
+// BTC
+import * as secp256k1 from '@bitcoinerlab/secp256k1'
+import * as descriptors from '@bitcoinerlab/descriptors'
+import {compilePolicy} from '@bitcoinerlab/miniscript'
+import {Psbt, networks} from 'bitcoinjs-lib'
+import {generateMnemonic, mnemonicToSeedSync} from 'bip39'
+// @ts-ignore
+import {encode as encodeAfter} from 'bip65'
+import {readFileSync, writeFileSync} from 'fs'
+import type {ECPairInterface} from 'ecpair'
+import * as crypto from 'crypto'
+const {Output, BIP32, ECPair} = descriptors.DescriptorsFactory(secp256k1)
+const network = networks.testnet
+const EXPLORER = 'https://blockstream.info/testnet'
+const JSONf = (json: object) => JSON.stringify(json, null, '\t')
+// BTC Ends
+
+const {Address} = Sdk
+
+jest.setTimeout(1000 * 60)
+
+const userPk = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d'
+const resolverPk = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a'
+
+// eslint-disable-next-line max-lines-per-function
+describe('Resolving example', () => {
+    const srcChainId = config.chain.source.chainId
+    const dstChainId = config.chain.destination.chainId
+
+    type Chain = {
+        node?: CreateServerReturnType | undefined
+        provider: JsonRpcProvider
+        escrowFactory: string
+        resolver: string
+    }
+
+    let src: Chain
+    let dst: Chain
+
+    let srcChainUser: Wallet
+    let dstChainUser: Wallet
+    let srcChainResolver: Wallet
+    let dstChainResolver: Wallet
+
+    let srcFactory: EscrowFactory
+    let dstFactory: EscrowFactory
+    let srcResolverContract: Wallet
+    let dstResolverContract: Wallet
+
+    let srcTimestamp: bigint
+
+    // BTC Onchain
+    const BLOCKS = 2
+    //const POLICY = (hashLock: string, timeLock: number) =>
+    //    `or(and(sha256(${hashLock}),pk(@redeemKey)),and(after(${timeLock}),pk(@refundKey)))`
+    const POLICY = (hashLock: string, timeLock: number, hashLockPartial25: string, hashLockPartial50: string) =>
+        `thresh(1, and(sha256(${hashLock}),pk(@redeemKey)),and(after(${timeLock}),pk(@refundKey)),and(sha256(${hashLockPartial50}),pk(@transitKey1)),and(sha256(${hashLockPartial25}),pk(@transitKey2)))`
+
+    // Initialize keys and secrets
+    let refundKeyPair: ECPairInterface
+    let redeemKeyPair: ECPairInterface
+
+    let transitKey1: ECPairInterface
+    let transitKey2: ECPairInterface
+
+    async function increaseTime(t: number): Promise<void> {
+        await Promise.all([src, dst].map((chain) => chain.provider.send('evm_increaseTime', [t])))
+    }
+
+    beforeAll(async () => {
+        ;[src, dst] = await Promise.all([initChain(config.chain.source), initChain(config.chain.destination)])
+
+        srcChainUser = new Wallet(userPk, src.provider)
+        dstChainUser = new Wallet(userPk, dst.provider)
+        srcChainResolver = new Wallet(resolverPk, src.provider)
+        dstChainResolver = new Wallet(resolverPk, dst.provider)
+
+        srcFactory = new EscrowFactory(src.provider, src.escrowFactory)
+        dstFactory = new EscrowFactory(dst.provider, dst.escrowFactory)
+        // get 1000 USDC for user in SRC chain and approve to LOP
+        await srcChainUser.topUpFromDonor(
+            config.chain.source.tokens.USDC.address,
+            config.chain.source.tokens.USDC.donor,
+            parseUnits('1000', 6)
+        )
+        await srcChainUser.approveToken(
+            config.chain.source.tokens.USDC.address,
+            config.chain.source.limitOrderProtocol,
+            MaxUint256
+        )
+
+        // get 2000 USDC for resolver in DST chain
+        srcResolverContract = await Wallet.fromAddress(src.resolver, src.provider)
+        dstResolverContract = await Wallet.fromAddress(dst.resolver, dst.provider)
+        await dstResolverContract.topUpFromDonor(
+            config.chain.destination.tokens.USDC.address,
+            config.chain.destination.tokens.USDC.donor,
+            parseUnits('2000', 6)
+        )
+        // top up contract for approve
+        await dstChainResolver.transfer(dst.resolver, parseEther('1'))
+        await dstResolverContract.unlimitedApprove(config.chain.destination.tokens.USDC.address, dst.escrowFactory)
+
+        srcTimestamp = BigInt((await src.provider.getBlock('latest'))!.timestamp)
+
+        transitKey1 = ECPair.fromWIF('L3hYoviekrcAfRLXVxH4q5ZuxSP6oJfcMUqKs9mYdfHqssf3hces')
+        transitKey2 = ECPair.fromWIF('KxxhqEPwWzfatjB2kCs893uW6Xr8qrmxwdgtkjwZRKEFLQTVYGVS')
+
+        // Onchain BTC ops
+        try {
+            refundKeyPair = ECPair.fromWIF(readFileSync('.refundWIF', 'utf8'))
+            redeemKeyPair = ECPair.fromWIF(readFileSync('.redeemWIF', 'utf8'))
+        } catch {
+            refundKeyPair = ECPair.makeRandom()
+            redeemKeyPair = ECPair.makeRandom()
+            writeFileSync('.refundWIF', refundKeyPair.toWIF())
+            writeFileSync('.redeemWIF', redeemKeyPair.toWIF())
+        }
+
+        console.log(
+            `Your BTC secrets 🤫: ${JSONf({
+                refundWIF: refundKeyPair.toWIF(),
+                redeemWIF: redeemKeyPair.toWIF()
+            })}`
+        )
+    })
+
+    async function getBalances(srcToken: string): Promise<{src: {user: bigint; resolver: bigint}}> {
+        return {
+            user: await srcChainUser.tokenBalance(srcToken),
+            resolver: await srcResolverContract.tokenBalance(srcToken)
+        }
+    }
+
+    async function createEscrowAddress(
+        hashLock: string,
+        hashLockPartial25: string,
+        hashLockPartial50: string
+    ): Promise<{address: string; wshOutput: any; timeLock: number}> {
+        const currentBlockHeight = parseInt(await (await fetch(`${EXPLORER}/api/blocks/tip/height`)).text())
+
+        const timeLock = BLOCKS //encodeAfter({blocks: currentBlockHeight + BLOCKS}) //
+        console.log(`Current block height: ${currentBlockHeight}`)
+
+        // Prepare the wsh utxo
+        const {miniscript, issane} = compilePolicy(POLICY(hashLock, timeLock, hashLockPartial25, hashLockPartial50))
+        if (!issane) throw new Error(`Error: miniscript is not sane`)
+
+        const wshDescriptor = `wsh(${miniscript
+            .replace('@redeemKey', redeemKeyPair.publicKey.toString('hex'))
+            .replace('@refundKey', refundKeyPair.publicKey.toString('hex'))
+            .replace('@transitKey1', transitKey1.publicKey.toString('hex'))
+            .replace('@transitKey2', transitKey2.publicKey.toString('hex'))})`
+
+        console.log(`Escrow descriptor ${wshDescriptor}`)
+
+        const wshOutput = new Output({
+            descriptor: wshDescriptor,
+            network
+        })
+
+        const address = wshOutput.getAddress()
+        return {address, timeLock}
+    }
+
+    async function broadcastSpendingTransaction(
+        utxo: any[],
+        preimage: string,
+        hashLock: string,
+        hashLockPartial25: string,
+        hashLockPartial50: string
+    ): Promise<{success: boolean; txId?: string; error?: string}> {
+        if (!utxo || utxo.length === 0) {
+            throw new Error('No UTXO available to spend')
+        }
+
+        console.log(`Creating spending transaction...`)
+
+        const txHex = await (await fetch(`${EXPLORER}/api/tx/${utxo[0].txid}/hex`)).text()
+        const inputValue = utxo[0].value
+        const psbt = new Psbt({network})
+
+        const timeLock = BLOCKS
+        const {miniscript, issane} = compilePolicy(POLICY(hashLock, timeLock, hashLockPartial25, hashLockPartial50))
+        if (!issane) throw new Error(`Error: miniscript is not sane`)
+
+        const wshDescriptor = `wsh(${miniscript
+            .replace('@redeemKey', redeemKeyPair.publicKey.toString('hex'))
+            .replace('@refundKey', refundKeyPair.publicKey.toString('hex'))
+            .replace('@transitKey1', transitKey1.publicKey.toString('hex'))
+            .replace('@transitKey2', transitKey2.publicKey.toString('hex'))})`
+
+        const wshOutput = new Output({
+            descriptor: wshDescriptor,
+            network,
+            signersPubKeys: [redeemKeyPair.publicKey],
+            preimages: [{digest: `sha256(${hashLock})`, preimage: preimage}]
+        })
+
+        const inputFinalizer = wshOutput.updatePsbtAsInput({
+            psbt,
+            txHex,
+            vout: utxo[0].vout
+        })
+
+        // Add output to send funds
+        new Output({
+            descriptor: `addr(tb1qrm793s9y67ejg3aca8ecgjc7nrruyhl3yk9t4k9mtjcp86kvefjspvmyzm)`,
+            network
+        }).updatePsbtAsOutput({psbt, value: inputValue - 1000})
+
+        descriptors.signers.signECPair({psbt, ecpair: redeemKeyPair})
+
+        // Finalize the transaction
+        inputFinalizer({psbt})
+        const spendTx = psbt.extractTransaction()
+
+        console.log(`Pushing transaction: ${spendTx.toHex()}`)
+
+        // Broadcast the transaction
+        const spendTxPushResult = await (
+            await fetch(`${EXPLORER}/api/tx`, {
+                method: 'POST',
+                body: spendTx.toHex()
+            })
+        ).text()
+
+        console.log(`Transaction push result: ${spendTxPushResult}`)
+
+        // Check if transaction was accepted
+        if (spendTxPushResult.match('non-BIP68-final') || spendTxPushResult.match('non-final')) {
+            console.log(`Transaction is still TimeLocked and miners rejected it.`)
+            return {
+                success: false,
+                error: 'Transaction is time-locked. Wait for more blocks to be mined.'
+            }
+        } else if (spendTxPushResult.length === 64) {
+            // Success - transaction ID returned
+            const txId = spendTx.getId()
+            console.log(`Success! Transaction ID: ${txId}`)
+            return {success: true, txId}
+        } else {
+            // Other error
+            return {
+                success: false,
+                error: spendTxPushResult
+            }
+        }
+    }
+
+    afterAll(async () => {
+        src.provider.destroy()
+        dst.provider.destroy()
+        await Promise.all([src.node?.stop(), dst.node?.stop()])
+    })
+
+    // eslint-disable-next-line max-lines-per-function
+    describe('Fill', () => {
+        ;(it('should swap Ethereum USDC -> Onchain BTC. Single fill only', async () => {
+            // User creates order
+            const sbytes = randomBytes(32)
+            const secret = '0x409a085a383ba90f51e1c5605904c3802210c7151fb558f4efbbf5023b345a08' //uint8ArrayToHex(sbytes)
+            const shalock =      '143250e48d33d9e780af5f7f89bd329088a03240568cb03fef87449528ec8226' //
+            const shapartial50 = 'a7426cc4a4f0b75825d44d0f25160e8313e15f0b80a56fbc424a82085b7480b7' //crypto.createHash('sha256').update(sbytes).digest('hex')
+            const shapartial25 = 'a7426cc4a4f0b75825d44d0f25160e8313e15f0b80a56fbc424a82085b7480bF' // not valid, its 100% flow
+
+            const {address} = await createEscrowAddress(shalock, shapartial25, shapartial50)
+
+            console.log('BTC escrow address: ', address)
+            console.log('SHA256 lock: ', shalock)
+
+            const initialUsdcBalances = await getBalances(config.chain.source.tokens.USDC.address)
+            console.log('✅ Initial user USDC balance:', initialUsdcBalances.user)
+            console.log('✅ Initial resolver USDC balance:', initialUsdcBalances.resolver)
+
+            const order = Sdk.CrossChainOrder.new(
+                new Address(src.escrowFactory),
+                {
+                    salt: Sdk.randBigInt(1000n),
+                    maker: new Address(await srcChainUser.getAddress()),
+                    makingAmount: parseUnits('100', 6),
+                    takingAmount: parseUnits('99', 6),
+                    makerAsset: new Address(config.chain.source.tokens.USDC.address),
+                    takerAsset: new Address(config.chain.destination.tokens.USDC.address)
+                },
+                {
+                    hashLock: Sdk.HashLock.forSingleFill(secret),
+                    timeLocks: Sdk.TimeLocks.new({
+                        srcWithdrawal: 10n, // 10sec finality lock for test
+                        srcPublicWithdrawal: 120n, // 2m for private withdrawal
+                        srcCancellation: 121n, // 1sec public withdrawal
+                        srcPublicCancellation: 122n, // 1sec private cancellation
+                        dstWithdrawal: 10n, // 10sec finality lock for test
+                        dstPublicWithdrawal: 100n, // 100sec private withdrawal
+                        dstCancellation: 101n // 1sec public withdrawal
+                    }),
+                    srcChainId,
+                    dstChainId,
+                    srcSafetyDeposit: parseEther('0.001'),
+                    dstSafetyDeposit: parseEther('0.001')
+                },
+                {
+                    auction: new Sdk.AuctionDetails({
+                        initialRateBump: 0,
+                        points: [],
+                        duration: 120n,
+                        startTime: srcTimestamp
+                    }),
+                    whitelist: [
+                        {
+                            address: new Address(src.resolver),
+                            allowFrom: 0n
+                        }
+                    ],
+                    resolvingStartTime: 0n
+                },
+                {
+                    nonce: Sdk.randBigInt(UINT_40_MAX),
+                    allowPartialFills: false,
+                    allowMultipleFills: false
+                }
+            )
+
+            const signature = await srcChainUser.signOrder(srcChainId, order)
+            const orderHash = order.getOrderHash(srcChainId)
+            // Resolver fills order
+            const resolverContract = new Resolver(src.resolver, dst.resolver)
+
+            console.log(`[${srcChainId}]`, `Filling order ${orderHash}`)
+
+            const fillAmount = order.makingAmount
+
+            const {txHash: orderFillHash, blockHash: srcDeployBlock} = await srcChainResolver.send(
+                resolverContract.deploySrc(
+                    srcChainId,
+                    order,
+                    signature,
+                    Sdk.TakerTraits.default()
+                        .setExtension(order.extension)
+                        .setAmountMode(Sdk.AmountMode.maker)
+                        .setAmountThreshold(order.takingAmount),
+                    fillAmount
+                )
+            )
+
+            console.log(`[${srcChainId}]`, `Order ${orderHash} filled for ${fillAmount} in tx ${orderFillHash}`)
+
+            const srcEscrowEvent = await srcFactory.getSrcDeployEvent(srcDeployBlock)
+
+            const dstImmutables = srcEscrowEvent[0]
+                .withComplement(srcEscrowEvent[1])
+                .withTaker(new Address(resolverContract.dstAddress))
+
+            const ESCROW_SRC_IMPLEMENTATION = await srcFactory.getSourceImpl()
+
+            const srcEscrowAddress = new Sdk.EscrowFactory(new Address(src.escrowFactory)).getSrcEscrowAddress(
+                srcEscrowEvent[0],
+                ESCROW_SRC_IMPLEMENTATION
+            )
+
+            console.log(`[${dstChainId}]`, `Depositing ${dstImmutables.amount} for order ${orderHash}`)
+
+            console.log(`🔄 Checking ${address}`)
+            const {utxo, hasFunds} = await checkBalance(address)
+
+            if (hasFunds) {
+                console.log(`\n✅ FUNDED! Found ${utxo.length} UTXO(s)`)
+            }
+
+            await increaseTime(11)
+
+            console.log(`[${srcChainId}]`, `Withdrawing funds for resolver from ${srcEscrowAddress}`)
+            const {txHash: resolverWithdrawHash} = await srcChainResolver.send(
+                resolverContract.withdraw('src', srcEscrowAddress, secret, srcEscrowEvent[0])
+            )
+            console.log(
+                `[${srcChainId}]`,
+                `Withdrew funds for resolver from ${srcEscrowAddress} to ${src.resolver} in tx ${resolverWithdrawHash}`
+            )
+
+            const result = await broadcastSpendingTransaction(
+                utxo,
+                secret.slice(2),
+                shalock,
+                shapartial25,
+                shapartial50
+            )
+
+            const finalUsdcBalance = await getBalances(config.chain.source.tokens.USDC.address)
+            console.log('✅ Final user USDC balance:', finalUsdcBalance.user)
+            console.log('✅ Final resolver USDC balance:', finalUsdcBalance.resolver)
+        }, 600000)
+
+        )
+    })
+})
+
+async function initChain(
+    cnf: ChainConfig
+): Promise<{node?: CreateServerReturnType; provider: JsonRpcProvider; escrowFactory: string; resolver: string}> {
+    const {node, provider} = await getProvider(cnf)
+    const deployer = new SignerWallet(cnf.ownerPrivateKey, provider)
+
+    // deploy EscrowFactory
+    const escrowFactory = await deploy(
+        factoryContract,
+        [
+            cnf.limitOrderProtocol,
+            cnf.wrappedNative, // feeToken,
+            Address.fromBigInt(0n).toString(), // accessToken,
+            deployer.address, // owner
+            60 * 30, // src rescue delay
+            60 * 30 // dst rescue delay
+        ],
+        provider,
+        deployer
+    )
+    console.log(`[${cnf.chainId}]`, `Escrow factory contract deployed to`, escrowFactory)
+
+    // deploy Resolver contract
+    const resolver = await deploy(
+        resolverContract,
+        [
+            escrowFactory,
+            cnf.limitOrderProtocol,
+            computeAddress(resolverPk) // resolver as owner of contract
+        ],
+        provider,
+        deployer
+    )
+    console.log(`[${cnf.chainId}]`, `Resolver contract deployed to`, resolver)
+
+    return {node: node, provider, resolver, escrowFactory}
+}
+
+async function getProvider(cnf: ChainConfig): Promise<{node?: CreateServerReturnType; provider: JsonRpcProvider}> {
+    if (!cnf.createFork) {
+        return {
+            provider: new JsonRpcProvider(cnf.url, cnf.chainId, {
+                cacheTimeout: -1,
+                staticNetwork: true
+            })
+        }
+    }
+
+    const node = createServer({
+        instance: anvil({forkUrl: cnf.url, chainId: cnf.chainId}),
+        limit: 1
+    })
+    await node.start()
+
+    const address = node.address()
+    assert(address)
+
+    const provider = new JsonRpcProvider(`http://[${address.address}]:${address.port}/1`, cnf.chainId, {
+        cacheTimeout: -1,
+        staticNetwork: true
+    })
+
+    return {
+        provider,
+        node
+    }
+}
+
+/**
+ * Deploy contract and return its address
+ */
+async function deploy(
+    json: {abi: any; bytecode: any},
+    params: unknown[],
+    provider: JsonRpcProvider,
+    deployer: SignerWallet
+): Promise<string> {
+    const deployed = await new ContractFactory(json.abi, json.bytecode, deployer).deploy(...params)
+    await deployed.waitForDeployment()
+
+    return await deployed.getAddress()
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function checkBalance(address: string): Promise<{utxo: any[]; hasFunds: boolean}> {
+    console.log(`Checking balance for address: ${address}`)
+    const utxo = await (await fetch(`${EXPLORER}/api/address/${address}/utxo`)).json()
+
+    const hasFunds = utxo && utxo.length > 0
+
+    if (hasFunds) {
+        console.log(`Successfully funded`)
+    } else {
+        console.log(`Not yet funded!`)
+    }
+
+    return {utxo, hasFunds}
+}
