@@ -5,6 +5,7 @@
 Install example deps
 
 ```shell
+npm install --save-dev pnpm --legacy-peer-deps
 pnpm install
 ```
 
@@ -19,6 +20,11 @@ Install contract deps
 ```shell
 forge install
 ```
+
+```shell
+anvil --host 0.0.0.0 --port 8545 --accounts 20 --balance 10000 & 
+```
+
 
 ## Running
 

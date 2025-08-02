@@ -4,7 +4,7 @@
  */
 
 export default {
-    maxWorkers: 1,
+    //maxWorkers: 2,
     clearMocks: true,
     moduleFileExtensions: ['js', 'json', 'ts'],
     rootDir: 'tests',
