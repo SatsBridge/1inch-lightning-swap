@@ -1,5 +1,21 @@
+import { bech32 } from "bech32";
+import cors from "cors";
+import "dotenv/config";
+import express, { Request, Response } from "express";
+import { Query } from "express-serve-static-core";
+import SSE from "express-sse";
+import { isNone, none, Option, some } from "fp-ts/lib/Option";
+import { unsafeUnwrap } from "fp-ts-std/Option";
+import morgan from "morgan";
+import { secp256k1 } from "@noble/curves/secp256k1";
+import { webcrypto } from "node:crypto";
 import { createSmartAccountClient, toOwner } from "permissionless";
 import { createPimlicoClient } from "permissionless/clients/pimlico";
+import {
+  toSafeSmartAccount,
+  ToSafeSmartAccountParameters,
+  ToSafeSmartAccountReturnType,
+} from "permissionless/accounts";
 import {
   Account,
   AccountSource,
@@ -36,24 +52,8 @@ import {
   WaitForUserOperationReceiptReturnType,
 } from "viem/account-abstraction";
 import { privateKeyToAccount, publicKeyToAddress } from "viem/accounts";
-import {
-  toSafeSmartAccount,
-  ToSafeSmartAccountParameters,
-  ToSafeSmartAccountReturnType,
-} from "permissionless/accounts";
 import { Chain } from "viem/chains";
 import * as allChains from "viem/chains";
-import express, { Request, Response } from "express";
-import { Query } from "express-serve-static-core";
-import cors from "cors";
-import SSE from "express-sse";
-import morgan from "morgan";
-import { bech32 } from "bech32";
-import { webcrypto } from "node:crypto";
-import { secp256k1 } from "@noble/curves/secp256k1";
-import "dotenv/config";
-import { isNone, none, Option, some } from "fp-ts/lib/Option";
-import { unsafeUnwrap } from "fp-ts-std/Option";
 
 import { getDefaultAddresses, hashUserOperation } from "./lib.ts";
 
@@ -66,8 +66,9 @@ function toAccount<accountSource extends AccountSource>(
   type: string,
 ): GetAccountReturnType<accountSource> {
   if (typeof source === "string") {
-    if (!isAddress(source, { strict: false }))
+    if (!isAddress(source, { strict: false })) {
       throw new InvalidAddressError({ address: source });
+    }
 
     return {
       address: source,
@@ -110,12 +111,12 @@ type State<
   [sessionK1: string]: {
     sse: SSE;
     counterpartyKey?: string;
+    safeAccountParams?: ToSafeSmartAccountParameters<
+      entryPointVersion,
+      TErc7579
+    >;
     userOps: {
       [userOpK1: string]: {
-        safeAccountParams: ToSafeSmartAccountParameters<
-          entryPointVersion,
-          TErc7579
-        >;
         userOp: PrepareUserOperationReturnType<
           account,
           accountOverride,
@@ -127,16 +128,16 @@ type State<
   };
 };
 
-function toLnurl(url: string) {
+function toLnurl(url: URL): string {
   return bech32
-    .encode("LNURL", bech32.toWords(Buffer.from(url, "utf8")), 1023)
+    .encode("LNURL", bech32.toWords(Buffer.from(url.toString(), "utf8")), 1023)
     .toUpperCase();
 }
 
 function traverse(
   obj: object,
   filter: (path: string) => boolean,
-  transform: (value: unknown) => unknown,
+  replacer: (value: unknown) => unknown,
   path: string = "",
 ): object {
   if (Array.isArray(obj)) {
@@ -152,9 +153,9 @@ function traverse(
       }
 
       if (typeof child === "object") {
-        newObj.push(traverse(child, filter, transform, keyPath));
+        newObj.push(traverse(child, filter, replacer, keyPath));
       } else if (typeof child !== "function") {
-        newObj.push(transform(child));
+        newObj.push(replacer(child));
       }
     }
 
@@ -178,9 +179,9 @@ function traverse(
       const child = obj[key];
 
       if (typeof child === "object") {
-        newObj[key] = traverse(child, filter, transform, keyPath);
+        newObj[key] = traverse(child, filter, replacer, keyPath);
       } else if (typeof child !== "function") {
-        newObj[key] = transform(child);
+        newObj[key] = replacer(child);
       }
     }
 
@@ -188,7 +189,7 @@ function traverse(
   }
 }
 
-function bigIntToSting(value: unknown): unknown {
+function paramsReplacer(value: unknown): unknown {
   if (typeof value === "bigint") {
     return value.toString() + "n";
   }
@@ -211,7 +212,7 @@ function safeAccountParamsTransform<
 
       return true;
     },
-    bigIntToSting,
+    paramsReplacer,
   );
 }
 
@@ -237,7 +238,7 @@ function userOpTransform<
     (_) => {
       return true;
     },
-    bigIntToSting,
+    paramsReplacer,
   );
 }
 
@@ -253,22 +254,26 @@ const serviceOwner = privateKeyToAccount(`0x${process.env.SERVICE_KEY!}`);
 const ownersThreshold = 2n;
 const chainId = 11155111;
 const safeVersion = "1.4.1";
-const chain = extractChain({
-  chains: Object.values(allChains),
-  id: chainId,
-});
+const chain = extractChain({ chains: Object.values(allChains), id: chainId });
 const publicClient = createPublicClient({
+  batch: { multicall: true },
   chain,
   transport: http(`https://${chainId}.rpc.thirdweb.com`),
 });
+
+if (chainId !== (await publicClient.getChainId())) {
+  throw new Error("Unexpected chainId");
+}
+
 const apiKey = process.env.PIMLICO_API_KEY!;
 const paymasterClient = createPimlicoClient({
-  entryPoint: {
-    address: entryPoint07Address,
-    version: entryPointVersion,
-  },
+  entryPoint: { address: entryPoint07Address, version: entryPointVersion },
   transport: http(`https://api.pimlico.io/v2/${chainId}/rpc?apikey=${apiKey}`),
 });
+
+if (chainId !== (await paymasterClient.getChainId())) {
+  throw new Error("Unexpected chainId");
+}
 
 const app = express();
 
@@ -359,7 +364,7 @@ app.get(
       throw new Error("Unreachable"); // make TypeScript linter happy
     }
 
-    const lnurl = toLnurl(url.toString());
+    const lnurl = toLnurl(url);
     const sse = new SSE();
 
     state[sessionK1] = { sse, userOps: {} };
@@ -368,9 +373,90 @@ app.get(
       delete state[sessionK1];
     });
     sse.init(req, res);
-    sse.send({ type: "init", sessionK1: sessionK1, lnurl });
+    sse.send({ type: "init", sessionK1: sessionK1, chainId, lnurl });
   },
 );
+
+async function prepareSmartAccount(
+  sessionK1: string,
+  counterpartyAddress: Address,
+): Promise<{
+  safeAccountParams: ToSafeSmartAccountParameters<
+    typeof entryPointVersion,
+    undefined
+  >;
+  safeAccount: ToSafeSmartAccountReturnType<typeof entryPointVersion>;
+}> {
+  let { safeAccountParams } = state[sessionK1];
+
+  if (safeAccountParams === undefined) {
+    const counterpartyOwner = toAccount(
+      {
+        address: counterpartyAddress,
+
+        async signMessage(_message) {
+          throw new Error("Not supported");
+        },
+
+        async signTransaction(_transaction, _options) {
+          throw new Error("Not supported");
+        },
+
+        async signTypedData(_typedData) {
+          throw new Error("Not supported");
+        },
+      },
+
+      "public",
+    );
+    const owners = [serviceOwner, counterpartyOwner];
+    const {
+      safeModuleSetupAddress,
+      safe4337ModuleAddress,
+      safeProxyFactoryAddress,
+      safeSingletonAddress,
+      multiSendAddress,
+      multiSendCallOnlyAddress,
+    } = getDefaultAddresses(safeVersion, entryPointVersion, {});
+    // https://docs.pimlico.io/guides/how-to/accounts/use-erc7579-account ???
+    safeAccountParams = {
+      client: publicClient,
+      entryPoint: {
+        address: entryPoint07Address,
+        version: entryPointVersion,
+      },
+      saltNonce: 0n,
+      version: safeVersion,
+      owners,
+      threshold: ownersThreshold,
+      safeModuleSetupAddress,
+      safe4337ModuleAddress,
+      safeProxyFactoryAddress,
+      safeSingletonAddress,
+      safeModules: [],
+      validators: [],
+      executors: [],
+      fallbacks: [],
+      hooks: [],
+      attesters: [],
+      attestersThreshold: 0,
+      multiSendAddress,
+      multiSendCallOnlyAddress,
+      paymentToken: zeroAddress,
+      payment: 0n,
+      paymentReceiver: zeroAddress,
+      setupTransactions: [],
+      validUntil: 0,
+      validAfter: 0,
+    } as ToSafeSmartAccountParameters<typeof entryPointVersion, undefined>;
+
+    Object.assign(state[sessionK1], { safeAccountParams });
+  }
+
+  const safeAccount = await toSafeSmartAccount(safeAccountParams);
+
+  return { safeAccountParams, safeAccount };
+}
 
 async function prepareUserOp<const calls extends readonly unknown[]>(
   sessionK1: string,
@@ -385,7 +471,6 @@ async function prepareUserOp<const calls extends readonly unknown[]>(
     undefined
   >;
   address: string;
-  chainId: number;
   userOp: PrepareUserOperationReturnType<
     ToSafeSmartAccountReturnType<typeof entryPointVersion>,
     undefined,
@@ -398,66 +483,10 @@ async function prepareUserOp<const calls extends readonly unknown[]>(
   >;
   lnurl: string;
 }> {
-  const counterpartyOwner = toAccount(
-    {
-      address: counterpartyAddress,
-
-      async signMessage(_message) {
-        throw new Error("Not supported");
-      },
-
-      async signTransaction(_transaction, _options) {
-        throw new Error("Not supported");
-      },
-
-      async signTypedData(_typedData) {
-        throw new Error("Not supported");
-      },
-    },
-
-    "public",
+  const { safeAccountParams, safeAccount } = await prepareSmartAccount(
+    sessionK1,
+    counterpartyAddress,
   );
-  const owners = [serviceOwner, counterpartyOwner];
-  const {
-    safeModuleSetupAddress,
-    safe4337ModuleAddress,
-    safeProxyFactoryAddress,
-    safeSingletonAddress,
-    multiSendAddress,
-    multiSendCallOnlyAddress,
-  } = getDefaultAddresses(safeVersion, entryPointVersion, {});
-  // https://docs.pimlico.io/guides/how-to/accounts/use-erc7579-account ???
-  const safeAccountParams = {
-    client: publicClient,
-    entryPoint: {
-      address: entryPoint07Address,
-      version: entryPointVersion,
-    },
-    saltNonce: 0n,
-    version: safeVersion,
-    owners,
-    threshold: ownersThreshold,
-    safeModuleSetupAddress,
-    safe4337ModuleAddress,
-    safeProxyFactoryAddress,
-    safeSingletonAddress,
-    safeModules: [],
-    validators: [],
-    executors: [],
-    fallbacks: [],
-    hooks: [],
-    attesters: [],
-    attestersThreshold: 0,
-    multiSendAddress,
-    multiSendCallOnlyAddress,
-    paymentToken: zeroAddress,
-    payment: 0n,
-    paymentReceiver: zeroAddress,
-    setupTransactions: [],
-    validUntil: 0,
-    validAfter: 0,
-  } as ToSafeSmartAccountParameters<typeof entryPointVersion, undefined>;
-  const safeAccount = await toSafeSmartAccount(safeAccountParams);
   const smartAccountClient = createSmartAccountClient({
     account: safeAccount,
     bundlerTransport: http(
@@ -470,13 +499,10 @@ async function prepareUserOp<const calls extends readonly unknown[]>(
         (await paymasterClient.getUserOperationGasPrice()).fast,
     },
   });
-  const userOp = await smartAccountClient.prepareUserOperation({
-    calls,
-  });
-  const userOpK1 = (await hashUserOperation(safeAccountParams, {
-    ...userOp,
-    chainId,
-  })).slice(2);
+  const userOp = await smartAccountClient.prepareUserOperation({ calls });
+  const userOpK1 = (
+    await hashUserOperation(safeAccountParams, { ...userOp, chainId })
+  ).slice(2);
   const { userOps } = state[sessionK1];
 
   if (userOpK1 in userOps) {
@@ -485,28 +511,24 @@ async function prepareUserOp<const calls extends readonly unknown[]>(
     throw new Error("UserOp exist");
   }
 
-  userOps[userOpK1] = {
-    safeAccountParams,
-    userOp,
-  };
+  userOps[userOpK1] = { userOp };
 
   const url = new URL(
     `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/userOp/commit/${sessionK1}?tag=login&k1=${userOpK1}&action=auth`,
   );
-  const lnurl = toLnurl(url.toString());
+  const lnurl = toLnurl(url);
 
   return {
     userOpK1,
     safeAccountParams,
     address: safeAccount.address,
-    chainId,
     userOp,
     lnurl,
   };
 }
 
 function parseCalls(
-  encodedCalls: string | undefined,
+  encodedCalls: string | undefined | any,
   res: Response,
 ): Option<unknown[]> {
   if (encodedCalls !== undefined && typeof encodedCalls !== "string") {
@@ -733,7 +755,7 @@ app.get(
     );
 
     if (isPrepareUserOp === undefined || isPrepareUserOp === "yes") {
-      const { userOpK1, safeAccountParams, address, chainId, userOp, lnurl } =
+      const { userOpK1, safeAccountParams, address, userOp, lnurl } =
         await prepareUserOp(sessionK1, counterpartyAddress, calls, req, res);
       const safeAccountParamsTrans =
         safeAccountParamsTransform(safeAccountParams);
@@ -745,15 +767,23 @@ app.get(
         counterpartyKey,
         safeAccountParams: safeAccountParamsTrans,
         address,
-        chainId,
         userOp: userOpTrans,
         prepareUrl,
         lnurl,
       });
     } else if (isPrepareUserOp === "no") {
+      const { safeAccountParams, safeAccount } = await prepareSmartAccount(
+        sessionK1,
+        counterpartyAddress,
+      );
+      const safeAccountParamsTrans =
+        safeAccountParamsTransform(safeAccountParams);
+
       Object.assign(notification, {
         type: "logined",
         counterpartyKey,
+        safeAccountParams: safeAccountParamsTrans,
+        address: safeAccount.address,
         prepareUrl,
       });
     } else {
@@ -770,12 +800,7 @@ app.get(
 
 app.get(
   "/vault/userOp/prepare/:sessionK1",
-  async (
-    req: TypedRequest<{
-      calls?: string | any;
-    }>,
-    res,
-  ) => {
+  async (req: TypedRequest<{ calls?: string | any }>, res) => {
     const { sessionK1 } = req.params;
     const { calls: encodedCalls } = req.query;
 
@@ -815,20 +840,16 @@ app.get(
       return;
     }
 
-    const { userOpK1, safeAccountParams, address, chainId, userOp, lnurl } =
-      await prepareUserOp(sessionK1, counterpartyAddress, calls, req, res);
-    const safeAccountParamsTrans =
-      safeAccountParamsTransform(safeAccountParams);
+    const { userOpK1, userOp, lnurl } = await prepareUserOp(
+      sessionK1,
+      counterpartyAddress,
+      calls,
+      req,
+      res,
+    );
     const userOpTrans = userOpTransform(userOp);
 
-    res.json({
-      userOpK1,
-      safeAccountParams: safeAccountParamsTrans,
-      address,
-      chainId,
-      userOp: userOpTrans,
-      lnurl,
-    });
+    res.json({ userOpK1, userOp: userOpTrans, lnurl });
   },
 );
 
@@ -931,8 +952,23 @@ app.get(
     const {
       sse,
       counterpartyKey: counterpartyKeyInSession,
+      safeAccountParams,
       userOps,
     } = state[sessionK1];
+
+    if (counterpartyKeyInSession === undefined) {
+      res.status(422).json({ status: "ERROR", reason: "Key not revealed" });
+
+      return;
+    }
+
+    if (safeAccountParams === undefined) {
+      res
+        .status(422)
+        .json({ status: "ERROR", reason: "Safe account not contructed" });
+
+      return;
+    }
 
     if (counterpartyKey !== counterpartyKeyInSession) {
       res
@@ -948,7 +984,7 @@ app.get(
       return;
     }
 
-    const { safeAccountParams, userOp } = userOps[userOpK1];
+    const { userOp } = userOps[userOpK1];
     const { owners } = safeAccountParams;
     const localOwners = await Promise.all(
       owners
