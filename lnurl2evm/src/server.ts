@@ -7,7 +7,6 @@ import {
   encodePacked,
   extractChain,
   concat,
-  concatHex,
   createPublicClient,
   CustomSource,
   EIP1193Provider,
@@ -21,36 +20,29 @@ import {
   LocalAccount,
   numberToHex,
   OneOf,
-  pad,
   parseEther,
   recoverPublicKey,
   serializeSignature,
   toHex,
   Transport,
-  UnionPartialBy,
   WalletClient,
   zeroAddress,
 } from "viem";
 import {
-  entryPoint06Abi,
-  entryPoint07Abi,
   entryPoint07Address,
   PrepareUserOperationRequest,
   PrepareUserOperationReturnType,
   SmartAccount,
-  UserOperation,
   WaitForUserOperationReceiptReturnType,
 } from "viem/account-abstraction";
 import { privateKeyToAccount, publicKeyToAddress } from "viem/accounts";
 import {
-  SafeVersion,
   toSafeSmartAccount,
   ToSafeSmartAccountParameters,
+  ToSafeSmartAccountReturnType,
 } from "permissionless/accounts";
-import { getChainId } from "viem/actions";
 import { Chain } from "viem/chains";
 import * as allChains from "viem/chains";
-import { getAction, hashTypedData } from "viem/utils";
 import express, { Request, Response } from "express";
 import { Query } from "express-serve-static-core";
 import cors from "cors";
@@ -63,247 +55,7 @@ import "dotenv/config";
 import { isNone, none, Option, some } from "fp-ts/lib/Option";
 import { unsafeUnwrap } from "fp-ts-std/Option";
 
-const EIP712_SAFE_OPERATION_TYPE_V06 = {
-  SafeOp: [
-    { type: "address", name: "safe" },
-    { type: "uint256", name: "nonce" },
-    { type: "bytes", name: "initCode" },
-    { type: "bytes", name: "callData" },
-    { type: "uint256", name: "callGasLimit" },
-    { type: "uint256", name: "verificationGasLimit" },
-    { type: "uint256", name: "preVerificationGas" },
-    { type: "uint256", name: "maxFeePerGas" },
-    { type: "uint256", name: "maxPriorityFeePerGas" },
-    { type: "bytes", name: "paymasterAndData" },
-    { type: "uint48", name: "validAfter" },
-    { type: "uint48", name: "validUntil" },
-    { type: "address", name: "entryPoint" },
-  ],
-};
-
-const EIP712_SAFE_OPERATION_TYPE_V07 = {
-  SafeOp: [
-    { type: "address", name: "safe" },
-    { type: "uint256", name: "nonce" },
-    { type: "bytes", name: "initCode" },
-    { type: "bytes", name: "callData" },
-    { type: "uint128", name: "verificationGasLimit" },
-    { type: "uint128", name: "callGasLimit" },
-    { type: "uint256", name: "preVerificationGas" },
-    { type: "uint128", name: "maxPriorityFeePerGas" },
-    { type: "uint128", name: "maxFeePerGas" },
-    { type: "bytes", name: "paymasterAndData" },
-    { type: "uint48", name: "validAfter" },
-    { type: "uint48", name: "validUntil" },
-    { type: "address", name: "entryPoint" },
-  ],
-};
-
-const SAFE_VERSION_TO_ADDRESSES_MAP: {
-  [key in SafeVersion]: {
-    [key in "0.6" | "0.7"]: {
-      SAFE_MODULE_SETUP_ADDRESS: Address;
-      SAFE_4337_MODULE_ADDRESS: Address;
-      SAFE_PROXY_FACTORY_ADDRESS: Address;
-      SAFE_SINGLETON_ADDRESS: Address;
-      MULTI_SEND_ADDRESS: Address;
-      MULTI_SEND_CALL_ONLY_ADDRESS: Address;
-    };
-  };
-} = {
-  "1.4.1": {
-    "0.6": {
-      SAFE_MODULE_SETUP_ADDRESS: "0x8EcD4ec46D4D2a6B64fE960B3D64e8B94B2234eb",
-      SAFE_4337_MODULE_ADDRESS: "0xa581c4A4DB7175302464fF3C06380BC3270b4037",
-      SAFE_PROXY_FACTORY_ADDRESS: "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67",
-      SAFE_SINGLETON_ADDRESS: "0x41675C099F32341bf84BFc5382aF534df5C7461a",
-      MULTI_SEND_ADDRESS: "0x38869bf66a61cF6bDB996A6aE40D5853Fd43B526",
-      MULTI_SEND_CALL_ONLY_ADDRESS:
-        "0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
-    },
-    "0.7": {
-      SAFE_MODULE_SETUP_ADDRESS: "0x2dd68b007B46fBe91B9A7c3EDa5A7a1063cB5b47",
-      SAFE_4337_MODULE_ADDRESS: "0x75cf11467937ce3F2f357CE24ffc3DBF8fD5c226",
-      SAFE_PROXY_FACTORY_ADDRESS: "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67",
-      SAFE_SINGLETON_ADDRESS: "0x41675C099F32341bf84BFc5382aF534df5C7461a",
-      MULTI_SEND_ADDRESS: "0x38869bf66a61cF6bDB996A6aE40D5853Fd43B526",
-      MULTI_SEND_CALL_ONLY_ADDRESS:
-        "0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
-    },
-  },
-};
-
-const getDefaultAddresses = (
-  safeVersion: SafeVersion,
-  entryPointVersion: "0.6" | "0.7",
-  {
-    addModuleLibAddress: _addModuleLibAddress,
-    safeModuleSetupAddress: _safeModuleSetupAddress,
-    safe4337ModuleAddress: _safe4337ModuleAddress,
-    safeProxyFactoryAddress: _safeProxyFactoryAddress,
-    safeSingletonAddress: _safeSingletonAddress,
-    multiSendAddress: _multiSendAddress,
-    multiSendCallOnlyAddress: _multiSendCallOnlyAddress,
-  }: {
-    addModuleLibAddress?: Address;
-    safeModuleSetupAddress?: Address;
-    safe4337ModuleAddress?: Address;
-    safeProxyFactoryAddress?: Address;
-    safeSingletonAddress?: Address;
-    multiSendAddress?: Address;
-    multiSendCallOnlyAddress?: Address;
-  },
-) => {
-  const safeModuleSetupAddress =
-    _safeModuleSetupAddress ??
-    _addModuleLibAddress ??
-    SAFE_VERSION_TO_ADDRESSES_MAP[safeVersion][entryPointVersion]
-      .SAFE_MODULE_SETUP_ADDRESS;
-  const safe4337ModuleAddress =
-    _safe4337ModuleAddress ??
-    SAFE_VERSION_TO_ADDRESSES_MAP[safeVersion][entryPointVersion]
-      .SAFE_4337_MODULE_ADDRESS;
-  const safeProxyFactoryAddress =
-    _safeProxyFactoryAddress ??
-    SAFE_VERSION_TO_ADDRESSES_MAP[safeVersion][entryPointVersion]
-      .SAFE_PROXY_FACTORY_ADDRESS;
-  const safeSingletonAddress =
-    _safeSingletonAddress ??
-    SAFE_VERSION_TO_ADDRESSES_MAP[safeVersion][entryPointVersion]
-      .SAFE_SINGLETON_ADDRESS;
-  const multiSendAddress =
-    _multiSendAddress ??
-    SAFE_VERSION_TO_ADDRESSES_MAP[safeVersion][entryPointVersion]
-      .MULTI_SEND_ADDRESS;
-
-  const multiSendCallOnlyAddress =
-    _multiSendCallOnlyAddress ??
-    SAFE_VERSION_TO_ADDRESSES_MAP[safeVersion][entryPointVersion]
-      .MULTI_SEND_CALL_ONLY_ADDRESS;
-
-  return {
-    safeModuleSetupAddress,
-    safe4337ModuleAddress,
-    safeProxyFactoryAddress,
-    safeSingletonAddress,
-    multiSendAddress,
-    multiSendCallOnlyAddress,
-  };
-};
-
-function getPaymasterAndData(unpackedUserOperation: UserOperation) {
-  return unpackedUserOperation.paymaster
-    ? concat([
-        unpackedUserOperation.paymaster,
-        pad(
-          toHex(
-            unpackedUserOperation.paymasterVerificationGasLimit || BigInt(0),
-          ),
-          {
-            size: 16,
-          },
-        ),
-        pad(toHex(unpackedUserOperation.paymasterPostOpGasLimit || BigInt(0)), {
-          size: 16,
-        }),
-        unpackedUserOperation.paymasterData || ("0x" as Hex),
-      ])
-    : "0x";
-}
-
-let chainIdMemoized: number;
-
-async function getMemoizedChainId() {
-  if (chainId) return chainId;
-  chainIdMemoized = publicClient.chain
-    ? publicClient.chain.id
-    : await getAction(publicClient, getChainId, "getChainId")({});
-  return chainIdMemoized;
-}
-
-async function hashUserOperation<
-  entryPointVersion extends "0.6" | "0.7",
-  TErc7579 extends Address | undefined,
->(
-  safeAccountParams: ToSafeSmartAccountParameters<entryPointVersion, TErc7579>,
-  parameters: UnionPartialBy<UserOperation, "sender"> & {
-    chainId?: number | undefined;
-  },
-) {
-  const {
-    version,
-    safe4337ModuleAddress: _safe4337ModuleAddress,
-    validAfter = 0,
-    validUntil = 0,
-  } = safeAccountParams;
-  const entryPoint = {
-    address: safeAccountParams.entryPoint?.address ?? entryPoint07Address,
-    abi:
-      (safeAccountParams.entryPoint?.version ?? "0.7") === "0.6"
-        ? entryPoint06Abi
-        : entryPoint07Abi,
-    version: safeAccountParams.entryPoint?.version ?? "0.7",
-  } as const;
-  const { safe4337ModuleAddress } = getDefaultAddresses(
-    version,
-    entryPoint.version,
-    {
-      safe4337ModuleAddress: _safe4337ModuleAddress,
-    },
-  );
-  const { chainId = await getMemoizedChainId(), ...userOperation } = parameters;
-
-  const message = {
-    safe: userOperation.sender,
-    callData: userOperation.callData,
-    nonce: userOperation.nonce,
-    initCode: userOperation.initCode ?? "0x",
-    maxFeePerGas: userOperation.maxFeePerGas,
-    maxPriorityFeePerGas: userOperation.maxPriorityFeePerGas,
-    preVerificationGas: userOperation.preVerificationGas,
-    verificationGasLimit: userOperation.verificationGasLimit,
-    callGasLimit: userOperation.callGasLimit,
-    paymasterAndData: userOperation.paymasterAndData ?? "0x",
-    validAfter: validAfter,
-    validUntil: validUntil,
-    entryPoint: entryPoint.address,
-  };
-
-  if ("initCode" in userOperation) {
-    message.paymasterAndData = userOperation.paymasterAndData ?? "0x";
-  }
-
-  if ("factory" in userOperation) {
-    if (userOperation.factory && userOperation.factoryData) {
-      message.initCode = concatHex([
-        userOperation.factory,
-        userOperation.factoryData,
-      ]);
-    }
-    if (!userOperation.sender) {
-      throw new Error("Sender is required");
-    }
-    message.paymasterAndData = getPaymasterAndData({
-      ...userOperation,
-      sender: userOperation.sender,
-    });
-  }
-
-  const hash = hashTypedData({
-    domain: {
-      chainId,
-      verifyingContract: safe4337ModuleAddress,
-    },
-    types:
-      entryPoint.version === "0.6"
-        ? EIP712_SAFE_OPERATION_TYPE_V06
-        : EIP712_SAFE_OPERATION_TYPE_V07,
-    primaryType: "SafeOp",
-    message: message,
-  });
-
-  return hash;
-}
+import { getDefaultAddresses, hashUserOperation } from "./lib.ts";
 
 type GetAccountReturnType<accountSource extends AccountSource> =
   | (accountSource extends Address ? JsonRpcAccount : never)
@@ -316,6 +68,7 @@ function toAccount<accountSource extends AccountSource>(
   if (typeof source === "string") {
     if (!isAddress(source, { strict: false }))
       throw new InvalidAddressError({ address: source });
+
     return {
       address: source,
       type: "json-rpc",
@@ -324,6 +77,7 @@ function toAccount<accountSource extends AccountSource>(
 
   if (!isAddress(source.address, { strict: false }))
     throw new InvalidAddressError({ address: source.address });
+
   return {
     address: source.address,
     nonceManager: source.nonceManager,
@@ -385,31 +139,61 @@ function traverse(
   transform: (value: unknown) => unknown,
   path: string = "",
 ): object {
-  const newObj = {};
+  if (Array.isArray(obj)) {
+    const newObj: unknown[] = [];
 
-  for (const key in obj) {
-    let keyPath: string;
+    for (const [key, child] of obj.entries()) {
+      let keyPath: string;
 
-    if (path === "") {
-      keyPath = key;
-    } else {
-      keyPath = `${path}.${key}`;
+      if (path === "") {
+        keyPath = `${key}`;
+      } else {
+        keyPath = `${path}.${key}`;
+      }
+
+      if (typeof child === "object") {
+        newObj.push(traverse(child, filter, transform, keyPath));
+      } else if (typeof child !== "function") {
+        newObj.push(transform(child));
+      }
     }
 
-    if (!filter(keyPath)) {
-      continue;
+    return newObj;
+  } else {
+    const newObj = {};
+
+    for (const key in obj) {
+      let keyPath: string;
+
+      if (path === "") {
+        keyPath = key;
+      } else {
+        keyPath = `${path}.${key}`;
+      }
+
+      if (!filter(keyPath)) {
+        continue;
+      }
+
+      const child = obj[key];
+
+      if (typeof child === "object") {
+        newObj[key] = traverse(child, filter, transform, keyPath);
+      } else if (typeof child !== "function") {
+        newObj[key] = transform(child);
+      }
     }
 
-    const child = obj[key];
+    return newObj;
+  }
+}
 
-    if (typeof child === "object") {
-      newObj[key] = traverse(child, filter, transform, keyPath);
-    } else if (typeof child !== "function") {
-      newObj[key] = transform(child);
-    }
+function bigIntToSting(value: unknown): unknown {
+  if (typeof value === "bigint") {
+    return value.toString() + "n";
   }
 
-  return newObj;
+  return value;
 }
 
 function safeAccountParamsTransform<
@@ -427,13 +211,33 @@ function safeAccountParamsTransform<
 
       return true;
     },
-    (value) => {
-      if (typeof value === "bigint") {
-        return value.toString() + "n";
-      }
+    bigIntToSting,
+  );
+}
 
-      return value;
+function userOpTransform<
+  const calls extends readonly unknown[],
+  const request extends PrepareUserOperationRequest<
+    account,
+    accountOverride,
+    calls
+  >,
+  account extends SmartAccount | undefined = SmartAccount | undefined,
+  accountOverride extends SmartAccount | undefined = undefined,
+>(
+  userOp: PrepareUserOperationReturnType<
+    account,
+    accountOverride,
+    calls,
+    request
+  >,
+): object {
+  return traverse(
+    userOp,
+    (_) => {
+      return true;
     },
+    bigIntToSting,
   );
 }
 
@@ -568,10 +372,10 @@ app.get(
   },
 );
 
-async function prepareUserOp(
+async function prepareUserOp<const calls extends readonly unknown[]>(
   sessionK1: string,
   counterpartyAddress: Address,
-  calls: unknown[],
+  calls: calls,
   req: Request,
   res: Response,
 ): Promise<{
@@ -581,6 +385,17 @@ async function prepareUserOp(
     undefined
   >;
   address: string;
+  chainId: number;
+  userOp: PrepareUserOperationReturnType<
+    ToSafeSmartAccountReturnType<typeof entryPointVersion>,
+    undefined,
+    calls,
+    PrepareUserOperationRequest<
+      ToSafeSmartAccountReturnType<typeof entryPointVersion>,
+      undefined,
+      calls
+    >
+  >;
   lnurl: string;
 }> {
   const counterpartyOwner = toAccount(
@@ -611,22 +426,36 @@ async function prepareUserOp(
     multiSendAddress,
     multiSendCallOnlyAddress,
   } = getDefaultAddresses(safeVersion, entryPointVersion, {});
+  // https://docs.pimlico.io/guides/how-to/accounts/use-erc7579-account ???
   const safeAccountParams = {
     client: publicClient,
     entryPoint: {
       address: entryPoint07Address,
       version: entryPointVersion,
     },
-    owners,
     saltNonce: 0n,
-    threshold: ownersThreshold,
     version: safeVersion,
+    owners,
+    threshold: ownersThreshold,
     safeModuleSetupAddress,
     safe4337ModuleAddress,
     safeProxyFactoryAddress,
     safeSingletonAddress,
+    safeModules: [],
+    validators: [],
+    executors: [],
+    fallbacks: [],
+    hooks: [],
+    attesters: [],
+    attestersThreshold: 0,
     multiSendAddress,
     multiSendCallOnlyAddress,
+    paymentToken: zeroAddress,
+    payment: 0n,
+    paymentReceiver: zeroAddress,
+    setupTransactions: [],
+    validUntil: 0,
+    validAfter: 0,
   } as ToSafeSmartAccountParameters<typeof entryPointVersion, undefined>;
   const safeAccount = await toSafeSmartAccount(safeAccountParams);
   const smartAccountClient = createSmartAccountClient({
@@ -644,8 +473,10 @@ async function prepareUserOp(
   const userOp = await smartAccountClient.prepareUserOperation({
     calls,
   });
-  const userOpHash = await hashUserOperation(safeAccountParams, userOp);
-  const userOpK1 = userOpHash.slice(2);
+  const userOpK1 = (await hashUserOperation(safeAccountParams, {
+    ...userOp,
+    chainId,
+  })).slice(2);
   const { userOps } = state[sessionK1];
 
   if (userOpK1 in userOps) {
@@ -664,7 +495,14 @@ async function prepareUserOp(
   );
   const lnurl = toLnurl(url.toString());
 
-  return { userOpK1, safeAccountParams, address: safeAccount.address, lnurl };
+  return {
+    userOpK1,
+    safeAccountParams,
+    address: safeAccount.address,
+    chainId,
+    userOp,
+    lnurl,
+  };
 }
 
 function parseCalls(
@@ -839,7 +677,6 @@ app.get(
     }
 
     const calls = unsafeUnwrap(maybeCalls);
-
     let counterpartyAddress: Address;
 
     try {
@@ -896,10 +733,11 @@ app.get(
     );
 
     if (isPrepareUserOp === undefined || isPrepareUserOp === "yes") {
-      const { userOpK1, safeAccountParams, address, lnurl } =
+      const { userOpK1, safeAccountParams, address, chainId, userOp, lnurl } =
         await prepareUserOp(sessionK1, counterpartyAddress, calls, req, res);
       const safeAccountParamsTrans =
         safeAccountParamsTransform(safeAccountParams);
+      const userOpTrans = userOpTransform(userOp);
 
       Object.assign(notification, {
         type: "loginedAndPrepare",
@@ -907,6 +745,8 @@ app.get(
         counterpartyKey,
         safeAccountParams: safeAccountParamsTrans,
         address,
+        chainId,
+        userOp: userOpTrans,
         prepareUrl,
         lnurl,
       });
@@ -960,7 +800,6 @@ app.get(
     }
 
     const calls = unsafeUnwrap(maybeCalls);
-
     let counterpartyAddress: Address;
 
     try {
@@ -976,20 +815,18 @@ app.get(
       return;
     }
 
-    const { userOpK1, safeAccountParams, address, lnurl } = await prepareUserOp(
-      sessionK1,
-      counterpartyAddress,
-      calls,
-      req,
-      res,
-    );
+    const { userOpK1, safeAccountParams, address, chainId, userOp, lnurl } =
+      await prepareUserOp(sessionK1, counterpartyAddress, calls, req, res);
     const safeAccountParamsTrans =
       safeAccountParamsTransform(safeAccountParams);
+    const userOpTrans = userOpTransform(userOp);
 
     res.json({
       userOpK1,
       safeAccountParams: safeAccountParamsTrans,
       address,
+      chainId,
+      userOp: userOpTrans,
       lnurl,
     });
   },

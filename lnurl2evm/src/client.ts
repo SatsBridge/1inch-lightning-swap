@@ -1,6 +1,10 @@
 import { EventSource } from "eventsource";
 import { bech32 } from "bech32";
 import { secp256k1 } from "@noble/curves/secp256k1";
+import { toSafeSmartAccount } from "permissionless/accounts";
+import { createPublicClient, extractChain, http } from "viem";
+import * as allChains from "viem/chains";
+import { hashUserOperation } from "./lib.ts";
 
 function fromLnurl(url: string): string {
   return Buffer.from(
@@ -61,10 +65,15 @@ es.addEventListener("message", async (event) => {
       break;
     }
     case "loginedAndPrepare": {
-      const { userOpK1, counterpartyKey, safeAccountParams, lnurl } =
-        JSON.parse(event.data, bigIntReviver);
-
-      console.log(safeAccountParams);
+      const {
+        userOpK1,
+        counterpartyKey,
+        safeAccountParams,
+        address,
+        chainId,
+        userOp: userOpParams,
+        lnurl,
+      } = JSON.parse(event.data, bigIntReviver);
 
       if (stage !== "loginAndPrepare") {
         throw Error("Invalid state transition");
@@ -76,6 +85,36 @@ es.addEventListener("message", async (event) => {
 
       if (userOpK1 in userOps) {
         throw Error("UserOp exist");
+      }
+
+      // Validate safeAccountParams, chainId and userOpParams there
+
+      const chain = extractChain({
+        chains: Object.values(allChains),
+        id: chainId,
+      });
+      const publicClient = createPublicClient({
+        chain,
+        transport: http(`https://${chainId}.rpc.thirdweb.com`),
+      });
+      const safeAccount = await toSafeSmartAccount({
+        ...safeAccountParams,
+        client: publicClient,
+      });
+
+      if (address !== safeAccount.address) {
+        throw Error("Invalid Safe address");
+      }
+
+      const gotUserOpK1 = (
+        await hashUserOperation(safeAccountParams, {
+          ...userOpParams,
+          chainId,
+        })
+      ).slice(2);
+
+      if (userOpK1 !== gotUserOpK1) {
+        throw Error("Invalid UserOp address");
       }
 
       userOps[userOpK1] = { stage: "prepare" };
