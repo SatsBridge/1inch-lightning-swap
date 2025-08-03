@@ -126,7 +126,7 @@ es.addEventListener("message", async (event) => {
       break;
     }
     case "logined": {
-      const { counterpartyKey, safeAccountParams, address, prepareUrl } =
+      const { counterpartyKey, safeAccountParams, address, prepareUserOpUrl } =
         JSON.parse(event.data, paramsReviver);
 
       if (stage !== "login") {
@@ -173,7 +173,7 @@ es.addEventListener("message", async (event) => {
         userOpK1,
         userOp: userOpParams,
         lnurl,
-      } = await fetch(`${prepareUrl}?calls=${encodedCalls}`)
+      } = await fetch(`${prepareUserOpUrl}?calls=${encodedCalls}`)
         .then((response) => response.text())
         .then((text) => JSON.parse(text, paramsReviver));
 

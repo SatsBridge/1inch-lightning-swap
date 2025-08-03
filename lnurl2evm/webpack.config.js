@@ -10,7 +10,7 @@ export default {
   context: path.resolve(__dirname, "src"),
   entry: {
     server: "./server.ts",
-    client: "./client.ts",
+    aaClient: "./aa-client.ts",
   },
   experiments: {
     outputModule: true,

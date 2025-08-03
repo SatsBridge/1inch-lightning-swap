@@ -750,9 +750,9 @@ app.get(
     }
 
     const notification = {};
-    const prepareUrl = new URL(
-      `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/userOp/prepare/${sessionK1}`,
-    );
+    let baseUrl = `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault`;
+    const prepareUserOpUrl = new URL(`${baseUrl}/userOp/prepare/${sessionK1}`);
+    const prepareCustomUrl = new URL(`${baseUrl}/custom/prepare/${sessionK1}`);
 
     if (isPrepareUserOp === undefined || isPrepareUserOp === "yes") {
       const { userOpK1, safeAccountParams, address, userOp, lnurl } =
@@ -768,7 +768,8 @@ app.get(
         safeAccountParams: safeAccountParamsTrans,
         address,
         userOp: userOpTrans,
-        prepareUrl,
+        prepareUserOpUrl,
+        prepareCustomUrl,
         lnurl,
       });
     } else if (isPrepareUserOp === "no") {
@@ -784,7 +785,8 @@ app.get(
         counterpartyKey,
         safeAccountParams: safeAccountParamsTrans,
         address: safeAccount.address,
-        prepareUrl,
+        prepareUserOpUrl,
+        prepareCustomUrl,
       });
     } else {
       throw new Error("Unreachable"); // make TypeScript linter happy
@@ -793,7 +795,10 @@ app.get(
     Object.assign(state[sessionK1], {
       counterpartyKey,
     });
-    sse.send(notification);
+
+    setTimeout(async () => {
+      sse.send(notification);
+    });
     res.json({ status: "OK" });
   },
 );
@@ -1068,7 +1073,7 @@ app.get(
     }
 
     const { validAfter = 0, validUntil = 0 } = safeAccountParams;
-    let unPackedSignatures = [
+    const unPackedSignatures = [
       {
         signer: counterpartyAddress,
         data: ethSignature!,
@@ -1134,6 +1139,200 @@ app.get(
     setTimeout(() => {
       delete userOps[userOpK1];
     }, 1_800_000); // clear after 30 min
+    res.json({ status: "OK" });
+  },
+);
+
+app.get(
+  "/vault/custom/prepare/:sessionK1",
+  async (req: TypedRequest<{ k1?: string | any }>, res) => {
+    const { sessionK1 } = req.params;
+    const { k1: customK1 } = req.query;
+
+    if (!(sessionK1 in state)) {
+      res.status(422).json({ status: "ERROR", reason: "Session dont't exist" });
+
+      return;
+    }
+
+    if (customK1 === undefined) {
+      res.status(422).json({ status: "ERROR", reason: "Missing k1" });
+
+      return;
+    }
+
+    if (typeof customK1 !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid k1 query type",
+      });
+
+      return;
+    }
+
+    const { counterpartyKey } = state[sessionK1];
+
+    if (counterpartyKey === undefined) {
+      res.status(422).json({ status: "ERROR", reason: "Key don't revealed" });
+
+      return;
+    }
+
+    let counterpartyAddress: Address;
+
+    try {
+      const uncompressedCounterpartyKey =
+        secp256k1.Point.fromHex(counterpartyKey).toHex(false);
+
+      counterpartyAddress = publicKeyToAddress(
+        `0x${uncompressedCounterpartyKey}`,
+      );
+    } catch (_) {
+      res.status(422).json({ status: "ERROR", reason: "Invalid key" });
+
+      return;
+    }
+
+    const url = new URL(
+      `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/custom/commit/${sessionK1}?tag=login&k1=${customK1}&action=auth`,
+    );
+    const lnurl = toLnurl(url);
+
+    res.json({ address: counterpartyAddress, lnurl });
+  },
+);
+
+app.get(
+  "/vault/custom/commit/:sessionK1",
+  async (
+    req: TypedRequest<{
+      k1?: string | any;
+      key?: string | any;
+      sig?: string | any;
+    }>,
+    res,
+  ) => {
+    const { sessionK1 } = req.params;
+    const { k1: customK1, key: counterpartyKey, sig: signature } = req.query;
+
+    if (customK1 === undefined) {
+      res.status(422).json({ status: "ERROR", reason: "Missing k1" });
+
+      return;
+    }
+
+    if (typeof customK1 !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid k1 query type",
+      });
+
+      return;
+    }
+
+    if (counterpartyKey === undefined) {
+      res.status(422).json({ status: "ERROR", reason: "Missing key" });
+
+      return;
+    }
+
+    if (typeof counterpartyKey !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid key query type",
+      });
+
+      return;
+    }
+
+    if (signature === undefined) {
+      res.status(422).json({ status: "ERROR", reason: "Missing sig" });
+
+      return;
+    }
+
+    if (typeof signature !== "string") {
+      res.status(422).json({
+        status: "ERROR",
+        reason: "Invalid sig query type",
+      });
+
+      return;
+    }
+
+    let uncompressedCounterpartyKey: string;
+
+    try {
+      uncompressedCounterpartyKey =
+        secp256k1.Point.fromHex(counterpartyKey).toHex(false);
+    } catch (_) {
+      res.status(422).json({ status: "ERROR", reason: "Invalid key" });
+
+      return;
+    }
+
+    if (
+      !secp256k1.verify(
+        fromHex(`0x${signature}`, "bytes"),
+        fromHex(`0x${customK1}`, "bytes"),
+        fromHex(`0x${counterpartyKey}`, "bytes"),
+        {
+          prehash: false,
+          format: "der",
+        },
+      )
+    ) {
+      res.status(422).json({ status: "ERROR", reason: "Invalid sig" });
+
+      return;
+    }
+
+    if (!(sessionK1 in state)) {
+      res.status(422).json({ status: "ERROR", reason: "Session dont't exist" });
+
+      return;
+    }
+
+    const { sse, counterpartyKey: counterpartyKeyInSession } = state[sessionK1];
+
+    if (counterpartyKeyInSession === undefined) {
+      res.status(422).json({ status: "ERROR", reason: "Key not revealed" });
+
+      return;
+    }
+
+    const { r, s } = secp256k1.Signature.fromHex(signature, "der");
+    let ethSignature: Hex;
+
+    for (let yParity = 0; yParity <= 1; yParity++) {
+      ethSignature = serializeSignature({
+        r: numberToHex(r, { size: 32 }),
+        s: numberToHex(s, { size: 32 }),
+        yParity,
+        to: "hex",
+      });
+
+      const recoveredCounterpartyKey = (
+        await recoverPublicKey({
+          hash: `0x${customK1}`,
+          signature: ethSignature,
+        })
+      ).slice(2);
+
+      if (recoveredCounterpartyKey === uncompressedCounterpartyKey) {
+        break;
+      } else if (yParity === 1) {
+        res
+          .status(500)
+          .json({ status: "ERROR", reason: "Internal server error" });
+
+        throw new Error("No valid signature");
+      }
+    }
+
+    setTimeout(async () => {
+      sse.send({ type: "commited", customK1 });
+    });
     res.json({ status: "OK" });
   },
 );
