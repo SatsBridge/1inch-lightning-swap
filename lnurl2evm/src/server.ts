@@ -366,64 +366,22 @@ app.get(
       throw new Error("Session exist");
     }
 
-    const baseUrl = `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/login`;
-    let url: URL;
+    const baseUrl = `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/login?tag=login&k1=${sessionK1}&action=register`;
+    let url = baseUrl;
 
-    if (type === undefined) {
-      if (isPrepareUserOp === undefined) {
-        if (calls === undefined) {
-          url = new URL(`${baseUrl}?tag=login&k1=${sessionK1}&action=register`);
-        } else {
-          url = new URL(
-            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_calls=${calls}`,
-          );
-        }
-      } else if (isPrepareUserOp === "yes" || isPrepareUserOp === "no") {
-        if (calls === undefined) {
-          url = new URL(
-            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_prepare=${isPrepareUserOp}`,
-          );
-        } else {
-          url = new URL(
-            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_prepare=${isPrepareUserOp}&_ext_sb_calls=${calls}`,
-          );
-        }
-      } else {
-        throw new Error("Unreachable"); // make TypeScript linter happy
-      }
-    } else if (type === "userOp") {
-      if (isPrepareUserOp === undefined) {
-        if (calls === undefined) {
-          url = new URL(
-            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_type=${type}`,
-          );
-        } else {
-          url = new URL(
-            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_type=${type}&_ext_sb_calls=${calls}`,
-          );
-        }
-      } else if (isPrepareUserOp === "yes" || isPrepareUserOp === "no") {
-        if (calls === undefined) {
-          url = new URL(
-            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_type=${type}&_ext_sb_prepare=${isPrepareUserOp}`,
-          );
-        } else {
-          url = new URL(
-            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_type=${type}&_ext_sb_prepare=${isPrepareUserOp}&_ext_sb_calls=${calls}`,
-          );
-        }
-      } else {
-        throw new Error("Unreachable"); // make TypeScript linter happy
-      }
-    } else if (type === "custom") {
-      url = new URL(
-        `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_type=${type}`,
-      );
-    } else {
-      throw new Error("Unreachable"); // make TypeScript linter happy
+    if (type !== undefined) {
+      url = `${url}&_ext_sb_type=${type}`;
     }
 
-    const lnurl = toLnurl(url);
+    if (isPrepareUserOp !== undefined) {
+      url = `${url}&_ext_sb_prepare=${isPrepareUserOp}`;
+    }
+
+    if (calls !== undefined) {
+      url = `${url}&_ext_sb_calls=${calls}`;
+    }
+
+    const lnurl = toLnurl(new URL(url));
     const sse = new SSE();
 
     state[sessionK1] = { sse, userOps: {} };
