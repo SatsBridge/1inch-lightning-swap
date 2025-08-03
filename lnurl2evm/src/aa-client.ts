@@ -77,9 +77,9 @@ const transfer = prepareEncodeFunctionData({
 const secretKey = process.env.COUNTERPARTY_KEY!;
 const publicKey = secp256k1.getPublicKey(secretKey, true);
 const key = secp256k1.Point.fromBytes(publicKey).toHex(true);
-const prepareUserOp: "yes" | "no" = "no";
+const prepareUserOp: "yes" | "no" = "yes";
 const es = new EventSource(
-  `http://localhost:8091/vault/userOp?prepare=${prepareUserOp}`,
+  `http://localhost:${process.env.PORT ?? 8000}/vault?prepare=${prepareUserOp}`,
 );
 
 es.addEventListener("message", async (event) => {
@@ -116,7 +116,6 @@ es.addEventListener("message", async (event) => {
         throw Error("Unknown status");
       }
 
-      // @ts-expect-error: TS2367
       if (prepareUserOp === "yes") {
         Object.assign(state, { stage: "loginAndPrepare", sessionK1 });
       } else if (prepareUserOp === "no") {

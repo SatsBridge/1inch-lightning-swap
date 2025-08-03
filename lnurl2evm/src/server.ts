@@ -280,15 +280,32 @@ const app = express();
 app.use(cors());
 
 app.get(
-  "/vault/userOp",
+  "/vault",
   (
     req: TypedRequest<{
+      type?: "userOp" | "custom" | string | any;
       prepare?: "yes" | "no" | string | any;
       calls?: string | any;
     }>,
     res,
   ) => {
-    let { prepare: isPrepareUserOp, calls } = req.query;
+    let { type, prepare: isPrepareUserOp, calls } = req.query;
+
+    if (type !== undefined && typeof type !== "string") {
+      res
+        .status(422)
+        .send({ status: "ERROR", reason: "Invalid type query type" });
+
+      return;
+    }
+
+    if (typeof type === "string" && type !== "userOp" && type !== "custom") {
+      res
+        .status(422)
+        .send({ status: "ERROR", reason: "Unknown type query value" });
+
+      return;
+    }
 
     if (isPrepareUserOp !== undefined && typeof isPrepareUserOp !== "string") {
       res
@@ -317,6 +334,16 @@ app.get(
       });
     }
 
+    if (
+      type === "custom" &&
+      (isPrepareUserOp !== undefined || calls !== undefined)
+    ) {
+      res.status(422).send({
+        status: "ERROR",
+        reason: "Query type and prepare or calls incompatible",
+      });
+    }
+
     if (calls !== undefined && typeof calls !== "string") {
       res
         .status(422)
@@ -339,26 +366,58 @@ app.get(
       throw new Error("Session exist");
     }
 
-    const baseUrl = `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/userOp`;
+    const baseUrl = `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/login`;
     let url: URL;
 
-    if (isPrepareUserOp === undefined || isPrepareUserOp === "yes") {
+    if (type === undefined) {
       if (isPrepareUserOp === undefined) {
-        isPrepareUserOp = "yes";
-      }
-
-      if (calls === undefined) {
-        url = new URL(
-          `${baseUrl}/login?tag=login&k1=${sessionK1}&action=register&_ext_sb_prepare=${isPrepareUserOp}`,
-        );
+        if (calls === undefined) {
+          url = new URL(`${baseUrl}?tag=login&k1=${sessionK1}&action=register`);
+        } else {
+          url = new URL(
+            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_calls=${calls}`,
+          );
+        }
+      } else if (isPrepareUserOp === "yes" || isPrepareUserOp === "no") {
+        if (calls === undefined) {
+          url = new URL(
+            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_prepare=${isPrepareUserOp}`,
+          );
+        } else {
+          url = new URL(
+            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_prepare=${isPrepareUserOp}&_ext_sb_calls=${calls}`,
+          );
+        }
       } else {
-        url = new URL(
-          `${baseUrl}/login?tag=login&k1=${sessionK1}&action=register&_ext_sb_prepare=${isPrepareUserOp}&_ext_sb_calls=${calls}`,
-        );
+        throw new Error("Unreachable"); // make TypeScript linter happy
       }
-    } else if (isPrepareUserOp === "no") {
+    } else if (type === "userOp") {
+      if (isPrepareUserOp === undefined) {
+        if (calls === undefined) {
+          url = new URL(
+            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_type=${type}`,
+          );
+        } else {
+          url = new URL(
+            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_type=${type}&_ext_sb_calls=${calls}`,
+          );
+        }
+      } else if (isPrepareUserOp === "yes" || isPrepareUserOp === "no") {
+        if (calls === undefined) {
+          url = new URL(
+            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_type=${type}&_ext_sb_prepare=${isPrepareUserOp}`,
+          );
+        } else {
+          url = new URL(
+            `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_type=${type}&_ext_sb_prepare=${isPrepareUserOp}&_ext_sb_calls=${calls}`,
+          );
+        }
+      } else {
+        throw new Error("Unreachable"); // make TypeScript linter happy
+      }
+    } else if (type === "custom") {
       url = new URL(
-        `${baseUrl}/login?tag=login&k1=${sessionK1}&action=register&_ext_sb_prepare=${isPrepareUserOp}`,
+        `${baseUrl}?tag=login&k1=${sessionK1}&action=register&_ext_sb_type=${type}`,
       );
     } else {
       throw new Error("Unreachable"); // make TypeScript linter happy
@@ -599,12 +658,13 @@ function parseCalls(
 }
 
 app.get(
-  "/vault/userOp/login",
+  "/vault/login",
   async (
     req: TypedRequest<{
       k1?: string | any;
       key?: string | any;
       sig?: string | any;
+      _ext_sb_type?: "userOp" | "custom" | string | any;
       _ext_sb_prepare?: "yes" | "no" | string | any;
       _ext_sb_calls?: string | any;
     }>,
@@ -614,9 +674,26 @@ app.get(
       k1: sessionK1,
       key: counterpartyKey,
       sig: signature,
+      _ext_sb_type: type,
       _ext_sb_prepare: isPrepareUserOp,
       _ext_sb_calls: encodedCalls,
     } = req.query;
+
+    if (type !== undefined && typeof type !== "string") {
+      res
+        .status(422)
+        .send({ status: "ERROR", reason: "Invalid type query type" });
+
+      return;
+    }
+
+    if (typeof type === "string" && type !== "userOp" && type !== "custom") {
+      res
+        .status(422)
+        .send({ status: "ERROR", reason: "Unknown type query value" });
+
+      return;
+    }
 
     if (sessionK1 === undefined) {
       res.status(422).json({ status: "ERROR", reason: "Missing k1" });
@@ -683,6 +760,16 @@ app.get(
       });
 
       return;
+    }
+
+    if (
+      type === "custom" &&
+      (isPrepareUserOp !== undefined || encodedCalls !== undefined)
+    ) {
+      res.status(422).send({
+        status: "ERROR",
+        reason: "Query type and prepare or calls incompatible",
+      });
     }
 
     if (encodedCalls !== undefined && isPrepareUserOp === "no") {
@@ -765,6 +852,7 @@ app.get(
         type: "loginedAndPrepare",
         userOpK1,
         counterpartyKey,
+        counterpartyAddress,
         safeAccountParams: safeAccountParamsTrans,
         address,
         userOp: userOpTrans,
@@ -772,7 +860,7 @@ app.get(
         prepareCustomUrl,
         lnurl,
       });
-    } else if (isPrepareUserOp === "no") {
+    } else if (type === "custom" || isPrepareUserOp === "no") {
       const { safeAccountParams, safeAccount } = await prepareSmartAccount(
         sessionK1,
         counterpartyAddress,
@@ -783,13 +871,12 @@ app.get(
       Object.assign(notification, {
         type: "logined",
         counterpartyKey,
+        counterpartyAddress,
         safeAccountParams: safeAccountParamsTrans,
         address: safeAccount.address,
         prepareUserOpUrl,
         prepareCustomUrl,
       });
-    } else {
-      throw new Error("Unreachable"); // make TypeScript linter happy
     }
 
     Object.assign(state[sessionK1], {
@@ -1178,27 +1265,12 @@ app.get(
       return;
     }
 
-    let counterpartyAddress: Address;
-
-    try {
-      const uncompressedCounterpartyKey =
-        secp256k1.Point.fromHex(counterpartyKey).toHex(false);
-
-      counterpartyAddress = publicKeyToAddress(
-        `0x${uncompressedCounterpartyKey}`,
-      );
-    } catch (_) {
-      res.status(422).json({ status: "ERROR", reason: "Invalid key" });
-
-      return;
-    }
-
     const url = new URL(
       `${process.env.PROTO ?? req.protocol}://${process.env.HOST ?? req.host}/vault/custom/commit/${sessionK1}?tag=login&k1=${customK1}&action=auth`,
     );
     const lnurl = toLnurl(url);
 
-    res.json({ address: counterpartyAddress, lnurl });
+    res.json({ lnurl });
   },
 );
 
