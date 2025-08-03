@@ -79,12 +79,17 @@ describe('Resolving example', () => {
 
     // BTC Onchain
     const BLOCKS = 2
-    const POLICY = (hashLock: string, timeLock: number) =>
-        `or(and(sha256(${hashLock}),pk(@redeemKey)),and(after(${timeLock}),pk(@refundKey)))`
+    //const POLICY = (hashLock: string, timeLock: number) =>
+    //    `or(and(sha256(${hashLock}),pk(@redeemKey)),and(after(${timeLock}),pk(@refundKey)))`
+    const POLICY = (hashLock: string, timeLock: number, hashLockPartial25: string, hashLockPartial50: string) =>
+        `thresh(1, and(sha256(${hashLock}),pk(@redeemKey)),and(after(${timeLock}),pk(@refundKey)),and(sha256(${hashLockPartial50}),pk(@transitKey1)),and(sha256(${hashLockPartial25}),pk(@transitKey2)))`
 
     // Initialize keys and secrets
     let refundKeyPair: ECPairInterface
     let redeemKeyPair: ECPairInterface
+
+    let transitKey1: ECPairInterface
+    let transitKey2: ECPairInterface
 
     async function increaseTime(t: number): Promise<void> {
         await Promise.all([src, dst].map((chain) => chain.provider.send('evm_increaseTime', [t])))
@@ -126,15 +131,18 @@ describe('Resolving example', () => {
 
         srcTimestamp = BigInt((await src.provider.getBlock('latest'))!.timestamp)
 
+        transitKey1 = ECPair.fromWIF('L3hYoviekrcAfRLXVxH4q5ZuxSP6oJfcMUqKs9mYdfHqssf3hces')
+        transitKey2 = ECPair.fromWIF('KxxhqEPwWzfatjB2kCs893uW6Xr8qrmxwdgtkjwZRKEFLQTVYGVS')
+
         // Onchain BTC ops
         try {
             refundKeyPair = ECPair.fromWIF(readFileSync('.refundWIF', 'utf8'))
             redeemKeyPair = ECPair.fromWIF(readFileSync('.redeemWIF', 'utf8'))
         } catch {
             refundKeyPair = ECPair.makeRandom()
-            redeemKeyPair  = ECPair.makeRandom()
+            redeemKeyPair = ECPair.makeRandom()
             writeFileSync('.refundWIF', refundKeyPair.toWIF())
-            writeFileSync('.redeemWIF', refundKeyPair.toWIF())
+            writeFileSync('.redeemWIF', redeemKeyPair.toWIF())
         }
 
         console.log(
@@ -152,37 +160,43 @@ describe('Resolving example', () => {
         }
     }
 
-    async function createEscrowAddress(hashLock: string): Promise<{address: string; wshOutput: any; timeLock: number}> {
+    async function createEscrowAddress(
+        hashLock: string,
+        hashLockPartial25: string,
+        hashLockPartial50: string
+    ): Promise<{address: string; wshOutput: any; timeLock: number}> {
         const currentBlockHeight = parseInt(await (await fetch(`${EXPLORER}/api/blocks/tip/height`)).text())
 
         const timeLock = BLOCKS //encodeAfter({blocks: currentBlockHeight + BLOCKS}) //
         console.log(`Current block height: ${currentBlockHeight}`)
 
         // Prepare the wsh utxo
-        const {miniscript, issane} = compilePolicy(POLICY(hashLock, timeLock))
+        const {miniscript, issane} = compilePolicy(POLICY(hashLock, timeLock, hashLockPartial25, hashLockPartial50))
         if (!issane) throw new Error(`Error: miniscript is not sane`)
 
         const wshDescriptor = `wsh(${miniscript
-            .replace(
-                '@redeemKey',
-                redeemKeyPair.publicKey.toString('hex')
-            )
-            .replace('@refundKey', refundKeyPair.publicKey.toString('hex'))})`
+            .replace('@redeemKey', redeemKeyPair.publicKey.toString('hex'))
+            .replace('@refundKey', refundKeyPair.publicKey.toString('hex'))
+            .replace('@transitKey1', transitKey1.publicKey.toString('hex'))
+            .replace('@transitKey2', transitKey2.publicKey.toString('hex'))})`
+
+        console.log(`Escrow descriptor ${wshDescriptor}`)
 
         const wshOutput = new Output({
             descriptor: wshDescriptor,
-            network,
-            signersPubKeys: [redeemKeyPair.publicKey]
+            network
         })
 
         const address = wshOutput.getAddress()
-        return {address, wshOutput, timeLock}
+        return {address, timeLock}
     }
 
     async function broadcastSpendingTransaction(
         utxo: any[],
         preimage: string,
-        hashLock: string
+        hashLock: string,
+        hashLockPartial25: string,
+        hashLockPartial50: string
     ): Promise<{success: boolean; txId?: string; error?: string}> {
         if (!utxo || utxo.length === 0) {
             throw new Error('No UTXO available to spend')
@@ -195,21 +209,20 @@ describe('Resolving example', () => {
         const psbt = new Psbt({network})
 
         const timeLock = BLOCKS
-        const {miniscript, issane} = compilePolicy(POLICY(hashLock, timeLock))
+        const {miniscript, issane} = compilePolicy(POLICY(hashLock, timeLock, hashLockPartial25, hashLockPartial50))
         if (!issane) throw new Error(`Error: miniscript is not sane`)
 
         const wshDescriptor = `wsh(${miniscript
-            .replace(
-                '@redeemKey',
-                redeemKeyPair.publicKey.toString('hex')
-            )
-            .replace('@refundKey', refundKeyPair.publicKey.toString('hex'))})`
+            .replace('@redeemKey', redeemKeyPair.publicKey.toString('hex'))
+            .replace('@refundKey', refundKeyPair.publicKey.toString('hex'))
+            .replace('@transitKey1', transitKey1.publicKey.toString('hex'))
+            .replace('@transitKey2', transitKey2.publicKey.toString('hex'))})`
 
         const wshOutput = new Output({
             descriptor: wshDescriptor,
             network,
             signersPubKeys: [redeemKeyPair.publicKey],
-            preimages: [{ digest: `sha256(${hashLock})`, preimage: preimage }],
+            preimages: [{digest: `sha256(${hashLock})`, preimage: preimage}]
         })
 
         const inputFinalizer = wshOutput.updatePsbtAsInput({
@@ -220,11 +233,11 @@ describe('Resolving example', () => {
 
         // Add output to send funds
         new Output({
-            descriptor: `addr(tb1qgx8hj9juuka6fse4ewl4qqq6m96hv5993c3wka)`,
+            descriptor: `addr(tb1qrm793s9y67ejg3aca8ecgjc7nrruyhl3yk9t4k9mtjcp86kvefjspvmyzm)`,
             network
         }).updatePsbtAsOutput({psbt, value: inputValue - 1000})
 
-        descriptors.signers.signECPair({ psbt, ecpair: redeemKeyPair });
+        descriptors.signers.signECPair({psbt, ecpair: redeemKeyPair})
 
         // Finalize the transaction
         inputFinalizer({psbt})
@@ -271,15 +284,15 @@ describe('Resolving example', () => {
 
     // eslint-disable-next-line max-lines-per-function
     describe('Fill', () => {
-        it('should swap Ethereum USDC -> Onchain BTC. Single fill only', async () => {
+        ;(it('should swap Ethereum USDC -> Onchain BTC. Single fill only', async () => {
             // User creates order
             const sbytes = randomBytes(32)
             const secret = '0x409a085a383ba90f51e1c5605904c3802210c7151fb558f4efbbf5023b345a08' //uint8ArrayToHex(sbytes)
-            const shalock = '143250e48d33d9e780af5f7f89bd329088a03240568cb03fef87449528ec8226' //crypto.createHash('sha256').update(sbytes).digest('hex')
-            console.log(secret)
-            console.log(shalock)
+            const shalock =      '143250e48d33d9e780af5f7f89bd329088a03240568cb03fef87449528ec8226' //
+            const shapartial50 = 'a7426cc4a4f0b75825d44d0f25160e8313e15f0b80a56fbc424a82085b7480b7' //crypto.createHash('sha256').update(sbytes).digest('hex')
+            const shapartial25 = 'a7426cc4a4f0b75825d44d0f25160e8313e15f0b80a56fbc424a82085b7480bF' // not valid, its 100% flow
 
-            const {address, wshOutput} = await createEscrowAddress(shalock)
+            const {address} = await createEscrowAddress(shalock, shapartial25, shapartial50)
 
             console.log('BTC escrow address: ', address)
             console.log('SHA256 lock: ', shalock)
@@ -376,15 +389,13 @@ describe('Resolving example', () => {
             console.log(`[${dstChainId}]`, `Depositing ${dstImmutables.amount} for order ${orderHash}`)
 
             console.log(`🔄 Checking ${address}`)
-            const { utxo, hasFunds } = await checkBalance(address);
+            const {utxo, hasFunds} = await checkBalance(address)
 
             if (hasFunds) {
                 console.log(`\n✅ FUNDED! Found ${utxo.length} UTXO(s)`)
             }
 
             await increaseTime(11)
-
-            //const result = await broadcastSpendingTransaction(utxo, secret.slice(2), shalock)
 
             console.log(`[${srcChainId}]`, `Withdrawing funds for resolver from ${srcEscrowAddress}`)
             const {txHash: resolverWithdrawHash} = await srcChainResolver.send(
@@ -395,12 +406,20 @@ describe('Resolving example', () => {
                 `Withdrew funds for resolver from ${srcEscrowAddress} to ${src.resolver} in tx ${resolverWithdrawHash}`
             )
 
-            const result = await broadcastSpendingTransaction(utxo, secret.slice(2), shalock)
+            const result = await broadcastSpendingTransaction(
+                utxo,
+                secret.slice(2),
+                shalock,
+                shapartial25,
+                shapartial50
+            )
 
             const finalUsdcBalance = await getBalances(config.chain.source.tokens.USDC.address)
             console.log('✅ Final user USDC balance:', finalUsdcBalance.user)
             console.log('✅ Final resolver USDC balance:', finalUsdcBalance.resolver)
         }, 600000)
+
+        )
     })
 })
 
