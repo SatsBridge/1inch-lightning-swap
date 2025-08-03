@@ -11,6 +11,7 @@ export default {
   entry: {
     server: "./server.ts",
     "aa-client": "./aa-client.ts",
+    "1inch-client": "./1inch-client.ts",
   },
   experiments: {
     outputModule: true,

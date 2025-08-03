@@ -799,7 +799,10 @@ app.get(
     const prepareUserOpUrl = new URL(`${baseUrl}/userOp/prepare/${sessionK1}`);
     const prepareCustomUrl = new URL(`${baseUrl}/custom/prepare/${sessionK1}`);
 
-    if (isPrepareUserOp === undefined || isPrepareUserOp === "yes") {
+    if (
+      (type === undefined || type === "userOp") &&
+      (isPrepareUserOp === undefined || isPrepareUserOp === "yes")
+    ) {
       const { userOpK1, safeAccountParams, address, userOp, lnurl } =
         await prepareUserOp(sessionK1, counterpartyAddress, calls, req, res);
       const safeAccountParamsTrans =
@@ -1361,7 +1364,7 @@ app.get(
     }
 
     setTimeout(async () => {
-      sse.send({ type: "commited", customK1 });
+      sse.send({ type: "commited", customK1, ethSignature });
     });
     res.json({ status: "OK" });
   },

@@ -41,6 +41,7 @@
   "scripts": {
     "build": "NODE_ENV=development webpack",
     "server": "NODE_ENV=development node dist/server.mjs",
-    "aa-client": "NODE_ENV=development node dist/aa-client.mjs"
+    "aa-client": "NODE_ENV=development node dist/aa-client.mjs",
+    "1inch-client": "NODE_ENV=development node dist/1inch-client.mjs"
   }
 }
